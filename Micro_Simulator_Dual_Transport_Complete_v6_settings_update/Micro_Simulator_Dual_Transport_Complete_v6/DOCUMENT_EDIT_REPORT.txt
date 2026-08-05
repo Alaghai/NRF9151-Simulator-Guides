@@ -1,0 +1,175 @@
+DOCUMENT EDIT REPORT
+Micro Simulator settings-update extension
+
+Editing approach
+----------------
+The three supplied guides were preserved. Changes were kept local and focused
+on short additions, table rows, command examples, and the minimum replacement
+of obsolete ZIP-based installation instructions. All final DOCX files were
+rendered to page images and visually inspected.
+
+1. 1_SoftSIM_and_Simulator_Setup_Guide_v6.docx
+------------------------------------------------
+Section: Cover/header version labels
+What: Changed visible Version 5 labels to Version 6.
+Why: Distinguishes the GitHub-folder and settings-response revision.
+Edit type: Existing text modified.
+
+Section: 6. Install the dual-transport simulator from the GitHub repository
+What: Replaced the instructions to move and extract a separately downloaded
+ZIP with clone/pull instructions and an installer path inside the normal
+GitHub repository folder.
+Why: Repository users will receive a normal folder rather than a separate
+simulator ZIP.
+Edit type: Existing Section 6 modified; unrelated sections preserved.
+
+Section: 7. Build and flash the simulator
+What: Added a short statement that the image supports heartbeat-response and
+settings-update testing.
+Why: Clarifies the additional development scope.
+Edit type: Existing sentence extended.
+
+Section: 11. Verify both outgoing packets and returned server responses
+What: Added AUTO mode, OK, ERROR, SUP, deferred FWUP, settings application,
+and reboot-persistence verification.
+Why: The prior text described only a normal OK response.
+Edit type: New paragraphs and bullets inserted.
+
+Section: 12. Troubleshooting
+What: Added rows for SUP without a complete packet, settings rejected or not
+persisted, expected FWUP deferral, and an incorrect repository folder path.
+Why: Covers failure modes introduced by settings delivery and repository-based
+installation.
+Edit type: New table rows inserted.
+
+Sections: Appendices A-C
+What: Replaced "install the simulator package" wording with clone/update the
+repository and run the installer from the simulator folder.
+Why: Removes stale package-ZIP terminology.
+Edit type: Small existing-text replacements.
+
+2. 2_Simulator_Protocol_Decisions_and_Usage_v7_SETTINGS_EXTENSION.docx
+------------------------------------------------------------------------
+Section: Cover companion-file line and extension contents list
+What: Added the shared protocol, settings, pending-store, update-tool, and
+response-parser files, plus a short contents continuation for Sections 19-22.
+Why: Makes the added implementation components and sections discoverable.
+Edit type: Existing companion line modified; new contents entries inserted.
+
+Section: 3. Canonical packet envelope
+What: Added command 0x20 to the command row without changing the Version 7
+header, Length, CRC, Sequence ID, timestamp, or byte-order rules.
+Why: Documents the settings-update command while preserving Version 7.
+Edit type: One table cell modified.
+
+Section: 3.1 Length calculation
+What: Added extended address-heartbeat and GPS-heartbeat sizes and Length
+values: 70/0x003E and 76/0x0044.
+Why: The new trusted-device registry adds 25 bytes to every dynamic heartbeat.
+Edit type: New table rows inserted.
+
+Section: 5. Command reference
+What: Added config show, config generate, config apply, config set, config
+reset confirm, and config last.
+Why: Documents the serial interface implemented in the simulator.
+Edit type: New table rows inserted.
+
+Section: 18.5 Server response modes
+What: Added AUTO, ERROR, SUP, and FWUP while retaining existing diagnostic
+response modes.
+Why: Separates normal automatic settings behavior from development diagnostics.
+Edit type: New table rows inserted.
+
+Section: 19. Extended heartbeat trusted-device registry
+What: Added the count-plus-four-slot layout, zero-fill rules, separation from
+opcode locationData and beacons, original/extended backward parsing, sizes,
+and a known-good packet.
+Why: Defines the implemented heartbeat extension.
+Edit type: New section inserted.
+
+Section: 20. Settings-update packet: command 0x20
+What: Added target IMEI, schema version, update ID, entry count, TLV layout,
+value types, settings registry, validation rules, atomic application, sample
+packet, and a positional-parser compatibility note.
+Why: Defines the requested settings protocol and records the mismatch with the
+under-development positional production parser.
+Edit type: New section inserted.
+
+Section: 21. Server responses and settings application
+What: Added OK, ERROR, SUP plus binary packet, deferred FWUP, persistence,
+partial-response buffering, and the absence of a final acknowledgement.
+Why: Documents the implemented TCP transaction and persistence behavior.
+Edit type: New section inserted.
+
+Section: 22. Decoder and test additions
+What: Added original/extended heartbeat, settings TLV, response-fragmentation,
+IMEI isolation, and C/Python registry test coverage.
+Why: Records the expanded validation and regression scope.
+Edit type: New subsection inserted.
+
+3. 3_Simulator_TCP_Server_and_Command_Guide_v7_SETTINGS_EXTENSION.docx
+------------------------------------------------------------------------
+Section: Cover and running header
+What: Changed "Document 3 of 4" to "Document 3 of 3" and added trusted
+heartbeat/AUTO settings wording.
+Why: Aligns the guide with the current three-document series and new server
+scope.
+Edit type: Existing text modified.
+
+Section: Quick-start deployment checklist
+What: Added AUTO mode, queue-by-IMEI, SUP packet, reboot persistence, invalid
+update protection, and text/JSONL log checks.
+Why: Adds deployment gates for the new behavior.
+Edit type: New checklist rows inserted.
+
+Section: 2.1 Version 7 packet prefix
+What: Added command 0x20 settings update to the command example.
+Why: Aligns server parsing with the implemented command set.
+Edit type: One table cell modified.
+
+Section: 5. Required server files
+What: Added micro_protocol.py, micro_pending_store.py, micro_update_tool.py,
+micro_response_parser.py, pending-update JSON, and protocol-trace JSONL.
+Why: Lists the additional operational and administrative files.
+Edit type: New table rows inserted.
+
+Sections: 6.1-6.2 Safe update workflow
+What: Replaced ZIP upload/extraction with GitHub pull, SCP from the repository,
+and creation of a server staging directory.
+Why: Removes obsolete ZIP assumptions.
+Edit type: Existing subsections modified.
+
+Section: 13. Server response modes
+What: Added AUTO, ERROR, SUP followed by a Version 7 binary packet, and FWUP;
+retained existing manual diagnostic modes.
+Why: Documents automatic server decisions without breaking diagnostics.
+Edit type: New table rows inserted.
+
+Section: 15. Troubleshooting
+What: Added SUP packet, repeated-update, wrong-IMEI, and deferred-FWUP rows.
+Why: Covers new settings-delivery failure modes.
+Edit type: New table rows inserted.
+
+Section: 17. Version 7 acceptance checklist
+What: Added original/extended heartbeat, trusted slots, AUTO, pending status,
+update-tool, logging, and Python/host-C test checks.
+Why: Defines acceptance criteria for the implemented extension.
+Edit type: New checklist rows inserted.
+
+Section: 18. AUTO mode and pending updates by IMEI
+What: Added state meanings, update-tool commands, sent_unconfirmed behavior,
+IMEI matching, and the SUP sequence.
+Why: Documents the automatic settings delivery and administration flow.
+Edit type: New section inserted.
+
+Section: 19. Local protocol and relay logs
+What: Added text/JSONL server and relay logging fields and clarified that no
+second diagnostic server is used.
+Why: Documents local protocol tracing requested for this task.
+Edit type: New section inserted.
+
+Section: 20. Updated tests
+What: Added Python compilation/unit-test and host-C test commands and the main
+coverage areas.
+Why: Makes the new regression tests reproducible.
+Edit type: New section inserted.

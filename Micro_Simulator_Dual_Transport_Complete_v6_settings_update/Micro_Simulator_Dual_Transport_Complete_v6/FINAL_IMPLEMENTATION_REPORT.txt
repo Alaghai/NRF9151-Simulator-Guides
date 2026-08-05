@@ -1,0 +1,179 @@
+FINAL IMPLEMENTATION REPORT
+Micro Simulator Dual-Transport Version 6
+Version 7 envelope with trusted-device and command-0x20 settings extensions
+
+1. Summary of implemented behavior
+----------------------------------
+- Preserved the Version 7 AB/10 envelope, big-endian Length/CRC/Sequence ID,
+  CRC-16/XMODEM payload-only coverage, binary integration mode, and ASCII-HEX
+  diagnostic mode.
+- Extended every dynamic heartbeat with trustedDeviceCount plus four six-byte
+  configured trusted-device slots. Unused slots are zero-filled. Opcode
+  locationData remains unchanged and separate.
+- Kept original Version 7 heartbeat decoding and regression vectors.
+- Added command 0x20 schema-versioned TLV settings packets.
+- Added persistent heartbeat, LTE update, sleep, safe-zone, beacon, and trusted
+  device settings.
+- Added atomic C-side packet validation and candidate application. Invalid
+  packets do not modify the active configuration.
+- Added Zephyr settings/NVS persistence and defaults fallback.
+- Added serial config show/generate/apply/set/reset/last. config set and reset
+  generate full packets and route them through the normal parser.
+- Added fragmented OK/ERROR/SUP/FWUP handling for direct LTE and relay paths.
+- Added automatic heartbeat scheduling from heartbeat_interval_seconds.
+- Added server AUTO mode and IMEI-specific pending updates.
+- Added generation/list/inspect/cancel/remove/requeue administration utility.
+- Added local server and relay JSON Lines logging.
+- Did not implement firmware-image transfer or a second diagnostic TCP mirror.
+
+2. Source files changed
+-----------------------
+- README.txt
+- CHANGELOG.txt
+- PACKAGE_MANIFEST.txt
+- applications/micro_simulator/CMakeLists.txt
+- applications/micro_simulator/prj.conf
+- applications/micro_simulator/src/main.c
+- tools/micro_relay/micro_serial_wifi_relay.py
+- tools/protocol_test/README.txt
+- tools/protocol_test/micro_packet_decoder.py
+- tools/protocol_test/micro_tcp_server.py
+- tools/protocol_test/test_micro_packet_decoder.py
+- tools/protocol_test/test_micro_tcp_server.py
+
+3. Source files added
+---------------------
+- applications/micro_simulator/src/micro_settings.c
+- applications/micro_simulator/src/micro_settings.h
+- tools/protocol_test/micro_protocol.py
+- tools/protocol_test/micro_pending_store.py
+- tools/protocol_test/micro_update_tool.py
+- tools/protocol_test/micro_response_parser.py
+- tools/protocol_test/micro_response_mode.txt.example
+- tools/protocol_test/micro_pending_updates.json.example
+- tools/protocol_test/micro_server.env.example
+- tools/protocol_test/micro-tcp-server.service.example
+
+4. Test files changed or added
+------------------------------
+Changed:
+- tools/protocol_test/test_micro_packet_decoder.py
+- tools/protocol_test/test_micro_tcp_server.py
+
+Added:
+- tools/protocol_test/test_micro_protocol.py
+- tools/protocol_test/test_micro_relay.py
+- tools/protocol_test/test_micro_settings_host.c
+- tools/protocol_test/run_c_settings_tests.sh
+
+5. Test commands run
+--------------------
+cd tools/protocol_test
+python3 -m py_compile *.py ../micro_relay/micro_serial_wifi_relay.py
+python3 -m unittest -v
+./run_c_settings_tests.sh
+
+6. Test results
+---------------
+- Python syntax checks: passed.
+- Python unit tests: 58 passed.
+- Host C settings parser/atomic candidate test: passed.
+- The relay test includes SUP and a binary settings packet fragmented with
+  delays longer than the former immediate-drain window.
+- A complete nRF Connect SDK/Zephyr build was not run because the required NCS
+  workspace/toolchain is not installed in the delivery environment.
+- Board flash, LTE-M, SoftSIM, and physical reboot persistence were not tested.
+
+7. New packet examples
+----------------------
+Extended beacon heartbeat, one configured trusted device, 70 bytes:
+AB10003E621D0001013836313335323036343035303738370000019F84DE77C0010107FF0101010FAC91003B9101AABBCCDDEE01000000000000000000000000000000000000
+
+Extended GPS heartbeat, one configured trusted device, 76 bytes:
+AB10004464B10001013836313335323036343035303738370000019F84DE77C0010107FF01011002B513BCFB7CF3D000FF000001AABBCCDDEE01000000000000000000000000000000000000
+
+Settings update: heartbeat_interval_seconds=60, update ID 1:
+AB10001A63A80001203836313335323036343035303738370100010101020002003C
+
+Multi-setting update, update ID 2:
+AB10003638EC000220383631333532303634303530373837010002040102000200780202000201E00302000201401206000C123456789123AABBCCDDEE02
+
+8. Serial command examples
+--------------------------
+config show
+config generate heartbeat_interval_seconds 60
+config apply AB10001A63A80001203836313335323036343035303738370100010101020002003C
+config set heartbeat_interval_seconds 60
+config reset confirm
+config last
+
+Raw list-setting values are HEX. Examples:
+config set trusted_device_list 123456789123AABBCCDDEE02
+config set beacon_list 1425252525250FAC91003B92
+
+9. TCP server update-generation examples
+-----------------------------------------
+Generate without queuing:
+python3 micro_update_tool.py generate --imei 861352064050787 --set heartbeat_interval_seconds=60
+
+Queue for AUTO delivery:
+python3 micro_update_tool.py queue --imei 861352064050787 --set heartbeat_interval_seconds=60
+
+Administrative commands:
+python3 micro_update_tool.py list
+python3 micro_update_tool.py inspect --imei 861352064050787
+python3 micro_update_tool.py requeue --imei 861352064050787
+python3 micro_update_tool.py cancel --imei 861352064050787
+python3 micro_update_tool.py remove --imei 861352064050787
+
+10. Documentation files
+-----------------------
+- docs/1_SoftSIM_and_Simulator_Setup_Guide_v6.docx
+- docs/2_Simulator_Protocol_Decisions_and_Usage_v7_SETTINGS_EXTENSION.docx
+- docs/3_Simulator_TCP_Server_and_Command_Guide_v7_SETTINGS_EXTENSION.docx
+- docs/Micro_Simulator_Project_README_v6.txt
+- DOCUMENT_EDIT_REPORT.txt contains section-by-section changes.
+
+11. Assumptions made
+--------------------
+- No existing repository command assignment conflicted with 0x20, so 0x20 was
+  used as required by the attached implementation specification.
+- The simulator's six-byte trusted-device identity/address is treated as a
+  non-secret development identifier. It is not assumed to solve randomized
+  phone-address identity in production.
+- Maximum safe zones, beacons, and trusted devices are four.
+- Safe-zone coordinates use signed int32 degrees x 10,000,000, matching the
+  provided production parser's latitude_e7/longitude_e7 names.
+- Development defaults are heartbeat=60 seconds, LTE update=480 seconds, and
+  sleep=480 seconds.
+- Numeric intervals accept 1..65535 seconds because no narrower authoritative
+  ranges were provided.
+- Radius must be non-zero; no upper radius limit beyond uint16 was provided.
+
+12. Unresolved protocol questions
+---------------------------------
+- The supplied production parser uses a positional payload, while this task
+  explicitly required a command-0x20 TLV payload. A production compatibility
+  decision is still required.
+- The production parser's final sending_update byte accepts 00 or FF, but its
+  precise state/acknowledgement semantics were not supplied. It is not exposed
+  as a persistent TLV setting.
+- No device-to-server acknowledgement confirming successful settings
+  application is defined. The server records sent_unconfirmed only.
+- A stable non-secret identity for phones using rotating BLE addresses remains
+  undefined. IRKs and bonding secrets are deliberately not transmitted.
+- Authoritative production defaults and narrower ranges for the intervals and
+  safe-zone radius remain to be confirmed.
+
+13. Known limitations and unimplemented work
+---------------------------------------------
+- No firmware image transfer, installation, bootloader, or rollback.
+- No production authentication or encryption.
+- No Bluetooth pairing, IRK provisioning, or address resolution.
+- No mobile application.
+- No traffic forwarding to a second diagnostic TCP server.
+- No real UTC/GNSS acquisition validation.
+- No actual NCS build, board flash, LTE attach, or on-board persistence test in
+  this environment.
+- The entire persistent C structure is stored as one versioned record. Future
+  struct migrations require a storage-version migration strategy.

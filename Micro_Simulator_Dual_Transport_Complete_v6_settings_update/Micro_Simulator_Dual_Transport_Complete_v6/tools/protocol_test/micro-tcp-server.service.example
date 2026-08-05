@@ -1,0 +1,19 @@
+[Unit]
+Description=Micro TCP Server Version 7 Settings Extension
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root
+ExecStart=/usr/bin/python3 -u /root/micro_tcp_server.py
+Restart=on-failure
+RestartSec=2
+Environment=MICRO_RESPONSE_MODE=/root/micro_response_mode.txt
+Environment=MICRO_PENDING_UPDATES=/root/micro_pending_updates.json
+Environment=MICRO_PACKET_LOG=/root/micro_tcp_packets.log
+Environment=MICRO_TRACE_LOG=/root/micro_protocol_trace.jsonl
+
+[Install]
+WantedBy=multi-user.target

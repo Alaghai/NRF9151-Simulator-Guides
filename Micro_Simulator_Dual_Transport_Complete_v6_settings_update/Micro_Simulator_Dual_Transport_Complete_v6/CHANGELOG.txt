@@ -1,0 +1,48 @@
+MICRO SIMULATOR PACKAGE CHANGELOG
+Version 6 - trusted-device registry and settings-update extension
+
+Firmware application
+--------------------
+- Added a 25-byte configured trusted-device extension to dynamic heartbeats.
+- Added persistent configuration through Zephyr settings/NVS.
+- Added command 0x20 TLV settings-update generation, validation, atomic apply,
+  and persistence.
+- Added config show/generate/apply/set/reset/last serial commands.
+- Added shared fragmented response parsing for direct LTE and relay paths.
+- Recognizes OK, ERROR, SUP, and deferred FWUP.
+- Added automatic heartbeat scheduling using the persistent interval.
+- Added micro_settings.c and micro_settings.h.
+
+Python protocol/server tools
+----------------------------
+- Added shared micro_protocol.py settings registry and packet utilities.
+- Extended decoder for original and extended heartbeat and settings packets.
+- Added server AUTO mode and pending updates by IMEI.
+- Added atomic pending-update JSON store and micro_update_tool.py.
+- Added structured JSON Lines protocol traces.
+- Added fragmented server-response parser tests.
+- Preserved manual diagnostic server modes.
+
+Windows relay
+-------------
+- Added local JSON Lines logging for external TCP connections, bytes sent and
+  received, response timeouts, serial control messages, and failures.
+
+Tests
+-----
+- Added extended heartbeat, settings TLV, IMEI isolation, AUTO response,
+  fragmentation, pending-state, and C/Python constant tests.
+- Added a host C test for atomic settings parsing.
+
+Documentation
+-------------
+- Guide 1 now treats the simulator as a normal GitHub repository folder rather
+  than a separately downloaded ZIP.
+- Added small protocol and server-guide sections for the new behavior.
+- Changed config reset confirm to generate and apply a complete defaults packet
+  through the normal settings validator rather than writing configuration
+  directly.
+- Added detailed old/new setting logs and changed-setting names in config last.
+- Updated the Windows relay to buffer fragmented SUP plus binary update packets
+  until the Version 7 Length field is satisfied.
+- Added relay response-framing tests; final Python test count is 58.

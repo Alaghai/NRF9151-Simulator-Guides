@@ -1,0 +1,18 @@
+FINAL TEST RESULTS
+
+Commands:
+  cd tools/protocol_test
+  python3 -m py_compile *.py ../micro_relay/micro_serial_wifi_relay.py
+  python3 -m unittest -v
+  ./run_c_settings_tests.sh
+
+Results:
+  Python compilation: PASS
+  Python tests: 58 PASS, 0 failures, 0 errors
+  Host C settings test: PASS
+
+Not executed:
+  nRF Connect SDK/Zephyr build
+  nRF9151 DK flash
+  SoftSIM/LTE-M integration
+  Physical reboot persistence
