@@ -33,7 +33,6 @@
 #include <unistd.h>
 
 #include <zephyr/device.h>
-#include <zephyr/debug/thread_analyzer.h>
 #include <zephyr/drivers/uart.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
@@ -1510,10 +1509,6 @@ static void log_relevant_stack_usage(const char *phase)
     log_thread_stack_usage(phase, micro_heartbeat);
     log_thread_stack_usage(phase, k_work_queue_thread_get(&k_sys_work_q));
 
-    /* This also reports shell, modem, relay/network, settings, and analyzer
-     * threads if those subsystems instantiate them in the selected build.
-     */
-    thread_analyzer_print(0);
 }
 
 static void schedule_next_heartbeat(void)
@@ -1563,8 +1558,8 @@ static void heartbeat_thread(void *p1, void *p2, void *p3)
             printk("Automatic heartbeat failed: %d\r\n", err);
         }
 
-        /* The analyzer sees the deepest mark left by the completed send,
-         * including TCP receive and SUP/settings parsing when applicable.
+        /* The stack snapshot captures the deepest mark left by the completed
+         * send, including TCP receive and SUP/settings parsing when applicable.
          */
         log_relevant_stack_usage("micro_heartbeat-after");
         schedule_next_heartbeat();
