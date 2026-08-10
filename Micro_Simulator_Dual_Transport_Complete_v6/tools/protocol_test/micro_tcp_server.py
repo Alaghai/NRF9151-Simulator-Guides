@@ -490,7 +490,7 @@ def main() -> None:
     print(f"Protocol trace: {TRACE_FILE}")
     print(f"Response mode file: {RESPONSE_MODE_FILE}")
     print(f"Pending updates: {PENDING_UPDATES_FILE}")
-    print("Protocol: Version 7 envelope with extended heartbeat and command 0x20 settings updates")
+    print("Protocol: canonical Version 7 envelope, extended heartbeat, and command 0x02 configuration updates")
     print("Accepted wire modes: binary 0xAB... and ASCII-HEX text AB...")
     if not RESPONSE_MODE_FILE.exists():
         RESPONSE_MODE_FILE.parent.mkdir(parents=True, exist_ok=True)

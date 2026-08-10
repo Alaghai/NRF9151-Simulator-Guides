@@ -2,9 +2,9 @@
 """Decode and validate Micro Version 7 application packets.
 
 Supported commands:
-- 0x01 original or extended heartbeat
+- 0x01 canonical heartbeat with complete trusted-device registry
+- 0x02 canonical full-replacement configuration update
 - 0x10 LTE-M location
-- 0x20 TLV settings update
 """
 
 from __future__ import annotations
@@ -24,7 +24,6 @@ from micro_protocol import (
     HEADER,
     PAYLOAD_OFFSET,
     PROPERTY,
-    SETTINGS_BY_ID,
     crc16_xmodem,
     decode_application_packet,
 )
@@ -52,7 +51,16 @@ class DecodeResult:
     summary: dict[str, Any]
 
     def json_ready(self) -> dict[str, Any]:
-        return asdict(self)
+        def make_safe(value: Any) -> Any:
+            if isinstance(value, bytes):
+                return value.hex().upper()
+            if isinstance(value, dict):
+                return {key: make_safe(item) for key, item in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [make_safe(item) for item in value]
+            return value
+
+        return make_safe(asdict(self))
 
 
 def unix_ms_to_iso8601(timestamp_ms: int) -> str | None:
@@ -160,7 +168,7 @@ def decode_packet(packet: bytes, *, target_imei: str | None = None) -> DecodeRes
         command_name = {
             COMMAND_HEARTBEAT: "heartbeat",
             COMMAND_LOCATION: "LTE-M location",
-            COMMAND_SETTINGS_UPDATE: "settings update",
+            COMMAND_SETTINGS_UPDATE: "configuration update",
         }.get(command, "unknown")
         _add(fields, 8, packet[8:9], "Command", f"0x{command:02X} ({command_name})")
 
@@ -226,7 +234,7 @@ def decode_packet(packet: bytes, *, target_imei: str | None = None) -> DecodeRes
                 extension_offset = 39 + location_length
                 registry = summary.get("trusted_device_registry")
                 if registry is None:
-                    _add(fields, extension_offset, b"", "Heartbeat format", "original Version 7")
+                    _add(fields, extension_offset, b"", "Heartbeat format", "missing required trusted-device registry")
                 elif len(packet) >= extension_offset + 25:
                     extension = packet[extension_offset : extension_offset + 25]
                     _add(
@@ -262,44 +270,34 @@ def decode_packet(packet: bytes, *, target_imei: str | None = None) -> DecodeRes
             )
 
     elif command == COMMAND_SETTINGS_UPDATE:
-        settings = summary.get("settings_update", {})
-        if len(payload) >= 19:
-            _add(fields, 9, payload[:15], "Target IMEI", settings.get("target_imei"))
-            _add(fields, 24, payload[15:16], "Settings schema version", settings.get("schema_version"))
-            _add(fields, 25, payload[16:18], "Update ID (uint16 big-endian)", settings.get("update_id"))
-            _add(fields, 27, payload[18:19], "Setting entry count", settings.get("entry_count"))
-            offset = 19
-            for index, entry in enumerate(settings.get("entries", []), start=1):
-                value_length = entry["value_length"]
-                if offset + 4 + value_length > len(payload):
-                    break
-                raw_header = payload[offset : offset + 4]
-                raw_value = payload[offset + 4 : offset + 4 + value_length]
-                _add(
-                    fields,
-                    9 + offset,
-                    raw_header,
-                    f"Setting entry {index} TLV header",
-                    {
-                        "setting_id": f"0x{entry['setting_id']:02X}",
-                        "setting_name": entry.get("setting_name"),
-                        "value_type": f"0x{entry['value_type']:02X}",
-                        "value_type_name": entry.get("value_type_name"),
-                        "value_length": value_length,
-                    },
-                )
-                _add(
-                    fields,
-                    9 + offset + 4,
-                    raw_value,
-                    f"Setting entry {index} value",
-                    {
-                        "decoded": entry.get("decoded_value"),
-                        "valid": entry.get("valid"),
-                        "error": entry.get("error"),
-                    },
-                )
-                offset += 4 + value_length
+        update = summary.get("configuration_update", {})
+        if len(payload) >= 17:
+            _add(fields, 9, payload[:15], "Target IMEI", update.get("target_imei"))
+            _add(fields, 24, payload[15:17], "Update ID (uint16 big-endian)", update.get("update_id"))
+            offset = 17
+            zone_count = payload[offset] if offset < len(payload) else 0
+            _add(fields, 9 + offset, payload[offset:offset + 1], "gpsSafeZoneCount", zone_count); offset += 1
+            for index in range(zone_count):
+                if offset + 10 > len(payload): break
+                _add(fields, 9 + offset, payload[offset:offset + 10], f"safeZone[{index}]", update.get("safe_zones", [])[index] if index < len(update.get("safe_zones", [])) else "invalid")
+                offset += 10
+            beacon_count = payload[offset] if offset < len(payload) else 0
+            _add(fields, 9 + offset, payload[offset:offset + 1], "beaconCount", beacon_count); offset += 1
+            for index in range(beacon_count):
+                if offset + 6 > len(payload): break
+                _add(fields, 9 + offset, payload[offset:offset + 6], f"beacon[{index}]", update.get("beacons", [])[index] if index < len(update.get("beacons", [])) else "invalid")
+                offset += 6
+            trusted_count = payload[offset] if offset < len(payload) else 0
+            _add(fields, 9 + offset, payload[offset:offset + 1], "trustedDeviceCount", trusted_count); offset += 1
+            for index in range(trusted_count):
+                if offset + 6 > len(payload): break
+                _add(fields, 9 + offset, payload[offset:offset + 6], f"trustedDevice[{index}]", update.get("trusted_devices", [])[index] if index < len(update.get("trusted_devices", [])) else "invalid")
+                offset += 6
+            if offset + 7 <= len(payload):
+                _add(fields, 9 + offset, payload[offset:offset + 2], "heartbeatIntervalSeconds", update.get("heartbeat_interval_seconds")); offset += 2
+                _add(fields, 9 + offset, payload[offset:offset + 2], "LTEupdateIntervalSeconds", update.get("lte_update_interval_seconds")); offset += 2
+                _add(fields, 9 + offset, payload[offset:offset + 2], "bleCheckIntervalSeconds", update.get("ble_check_interval_seconds")); offset += 2
+                _add(fields, 9 + offset, payload[offset:offset + 1], "SendingUpdate", update.get("sending_update"))
 
     if command not in (COMMAND_HEARTBEAT, COMMAND_LOCATION, COMMAND_SETTINGS_UPDATE):
         diagnostics.append("The command is not defined by the updated simulator protocol.")

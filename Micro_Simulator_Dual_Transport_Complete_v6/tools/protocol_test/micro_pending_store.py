@@ -76,15 +76,23 @@ class PendingUpdateStore:
     ) -> dict[str, Any]:
         validate_imei(imei)
         decoded = decode_application_packet(packet, target_imei=imei)
-        if not decoded.get("valid") or decoded.get("command_name") != "settings update":
-            raise ProtocolError("Queued packet is not a valid settings update for the selected IMEI: " + "; ".join(decoded.get("errors", [])))
+        if not decoded.get("valid") or decoded.get("command_name") != "configuration update":
+            raise ProtocolError("Queued packet is not a valid canonical configuration update for the selected IMEI: " + "; ".join(decoded.get("errors", [])))
         update = decoded["settings_update"]
         record = {
             "target_imei": imei,
             "update_id": update["update_id"],
             "created_at": utc_timestamp(),
             "created_by": source,
-            "settings": settings if settings is not None else update["entries"],
+            "configuration": settings if settings is not None else {
+                "heartbeat_interval_seconds": update["heartbeat_interval_seconds"],
+                "lte_update_interval_seconds": update["lte_update_interval_seconds"],
+                "ble_check_interval_seconds": update["ble_check_interval_seconds"],
+                "safe_zones": update["safe_zones"],
+                "beacons": update["beacons"],
+                "trusted_devices": update["trusted_devices"],
+                "sending_update": update["sending_update"],
+            },
             "packet_hex": packet.hex().upper(),
             "status": "pending",
             "send_count": 0,

@@ -1,95 +1,106 @@
-MICRO SIMULATOR PROTOCOL VERSION 7 - SETTINGS-UPDATE EXTENSION
+MICRO SIMULATOR PROTOCOL TEST TOOLS - CANONICAL VERSION 8
 
 Purpose
 -------
-This folder contains the shared Python protocol implementation, decoder, TCP
-server, pending-update tool, response parser, examples, and automated tests.
-The Version 7 envelope remains unchanged.
+This folder contains the shared Version 7-envelope/Version 8-behavior protocol
+implementation, decoder, TCP server, pending-update store, response parser,
+update tool, deterministic runtime state-machine model, document builder, and
+regression tests. It implements the cross-team canonical command-0x02
+positional full-replacement configuration update.
 
-Implemented extensions
-----------------------
-- Dynamic heartbeats append a 25-byte configured trusted-device registry.
-- Original Version 7 heartbeats remain decodable.
-- SETTINGS_UPDATE uses command 0x20 and a typed TLV payload.
-- Server AUTO mode returns OK, ERROR, or SUP followed by one binary update.
-- FWUP can be recognized by the simulator but firmware-image handling is not
-  implemented.
-- Pending updates are stored by IMEI in an atomic JSON file.
-- Packet and connection traffic is logged locally; no second diagnostic server
-  is used.
+Inputs and outputs
+------------------
+- Input: Version 7 binary packets or diagnostic ASCII-HEX packet text.
+- Output: envelope/CRC validation, decoded state, TCP responses, queued
+  IMEI-specific command-0x02 packets, and protocol test results.
+- The old command-0x20 TLV settings packet is rejected; it is not an accepted
+  fallback path.
 
-Files
------
+Important files
+---------------
 micro_protocol.py
-    Shared Python constants, settings registry, encoders, and validators.
+    Shared packet constants, builders, and strict validators.
 micro_packet_decoder.py
-    Decoder for original/extended heartbeat, location, and settings update.
+    Console decoder for heartbeat, location, and command-0x02 packets.
 micro_tcp_server.py
-    Persistent stream-framing server with AUTO mode and structured logs.
+    TCP stream-framing test server with automatic IMEI-isolated updates.
 micro_pending_store.py
-    Atomic JSON pending-update storage by IMEI.
+    Atomic JSON pending-update storage by target IMEI.
 micro_update_tool.py
-    Generate, queue, list, inspect, cancel, remove, and requeue updates.
+    Generates and queues full-replacement command-0x02 configuration packets.
+micro_state_machine.py
+    Hardware-free reference model for configuration mode, runtime states, and
+    independent BLE, heartbeat, and LTE timer schedules.
 micro_response_parser.py
-    Host-side model/test utility for fragmented OK/ERROR/SUP/FWUP responses.
-test_micro_protocol.py
-    Heartbeat, settings packet, and C/Python constant-regression tests.
-test_micro_packet_decoder.py
-    Decoder regression tests.
-test_micro_tcp_server.py
-    TCP stream, AUTO response, IMEI isolation, and response-fragment tests.
-test_micro_settings_host.c / run_c_settings_tests.sh
-    Host compilation test for the C settings parser and atomic candidate logic.
+    Buffers fragmented OK/ERROR/SUP/FWUP server responses.
+build_protocol_docs.py
+    Builds the canonical Word protocol and Version 8 guides.
 
 Run all Python tests
 --------------------
-python3 -m unittest -v
+In Anaconda Prompt or PowerShell:
 
-Run the host C settings tests
------------------------------
-./run_c_settings_tests.sh
+  python -m unittest -v
 
-Generate a packet without queuing
----------------------------------
-python3 micro_update_tool.py generate \
-  --imei 861352064050787 \
-  --set heartbeat_interval_seconds=60
+Run the host C settings test
+----------------------------
+On Linux/macOS, or a shell with a C compiler in PATH:
+
+  ./run_c_settings_tests.sh
+
+The host C test validates the firmware configuration-payload parser and
+candidate/atomic-application logic. It does not flash hardware.
+
+Generate a full update without queuing it
+-----------------------------------------
+All seven fields must be supplied. Values for safe_zones, beacon_list, and
+trusted_device_list are concatenated HEX. An empty value clears a list.
+
+  python micro_update_tool.py generate --imei 861352064050787 --update-id 1 --set heartbeat_interval_seconds=60 --set lte_update_interval_seconds=1023 --set ble_check_interval_seconds=480 --set safe_zones=02B513BCFB7CF3D00096 --set beacon_list=0FAC91003B91 --set trusted_device_list=AABBCCDDEE01 --set sending_update=00
 
 Queue a pending update
 ----------------------
-python3 micro_update_tool.py queue \
-  --imei 861352064050787 \
-  --set heartbeat_interval_seconds=60
 
-List updates
-------------
-python3 micro_update_tool.py list
+  python micro_update_tool.py queue --imei 861352064050787 --update-id 1 --set heartbeat_interval_seconds=60 --set lte_update_interval_seconds=1023 --set ble_check_interval_seconds=480 --set safe_zones=02B513BCFB7CF3D00096 --set beacon_list=0FAC91003B91 --set trusted_device_list=AABBCCDDEE01 --set sending_update=00
 
 Run the server
 --------------
-Keep all Python files in this directory together. On the deployment server,
-copy them to /root, set /root/micro_response_mode.txt to AUTO, and run:
 
-python3 -u /root/micro_tcp_server.py
+  python micro_tcp_server.py
 
-Important protocol values
--------------------------
-- Header: 0xAB
-- Property: 0x10
-- Length: uint16 big-endian, Command + Payload
-- CRC: CRC-16/XMODEM over Payload only, big-endian
-- Sequence ID: uint16 big-endian
-- Heartbeat: command 0x01
-- Location: command 0x10
-- Settings update: command 0x20
-- Extended address heartbeat: 70 bytes, Length 0x003E
-- Extended GPS heartbeat: 76 bytes, Length 0x0044
+For a valid heartbeat, AUTO mode returns OK followed by newline when no update
+is pending. When a matching update exists, it returns SUP followed by newline
+and one full binary command-0x02 packet. The server buffers split TCP reads and
+keeps updates isolated by target IMEI.
 
-Firmware-parser compatibility note
-----------------------------------
-The supplied under-development firmware function parses a positional update
-payload containing zones, beacons, trusted devices, LTE interval, sleep
-interval, and a final sending-update flag. The simulator task specification
-explicitly requested the new TLV command 0x20. The setting meanings were used
-as reference, but the TLV packet is not binary-compatible with that positional
-firmware parser until the firmware implements the same command and schema.
+Decode a packet
+---------------
+
+  python micro_packet_decoder.py AB100032EF0E00010238363133353230363430353037383700010102B513BCFB7CF3D00096010FAC91003B9101AABBCCDDEE01003C03FF01E000
+
+Build protocol documents
+------------------------
+
+  python build_protocol_docs.py
+
+Outputs are written to ../../docs:
+- 2_Simulator_Protocol_Decisions_and_Usage_v7_SETTINGS_EXTENSION.docx
+- 3_Simulator_TCP_Server_and_Command_Guide_v7_SETTINGS_EXTENSION.docx
+
+The current Micro Data Packet V8 source document is
+docs/Micro_Data_Packet_V8_State_Machine_and_Settings.docx. It is kept as a
+separate source-of-truth artifact because it may be open in Word while the two
+operational guides are regenerated.
+
+BLE interval name
+-----------------
+Use ble_check_interval_seconds in new tools and automation. It is the same
+uint16 packet field previously named sleep_interval_seconds, so existing
+canonical packet HEX stays byte-for-byte unchanged. The builders accept the old
+name only as a clearly marked compatibility alias.
+
+Security
+--------
+Do not place SoftSIM profiles, credentials, passwords, IRKs, bonding keys,
+private keys, or other secrets in packet logs, test fixtures, or the pending
+JSON store. The six-byte development identifiers are non-secret test values.

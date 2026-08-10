@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Development utility for generating and queuing Micro settings updates."""
+"""Generate and queue canonical command-0x02 full-replacement updates."""
 
 from __future__ import annotations
 
@@ -24,13 +24,15 @@ from micro_protocol import (
 DEFAULT_STORE = pathlib.Path("/root/micro_pending_updates.json")
 
 
-def parse_assignments(items: list[str]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def parse_assignments(items: list[str]) -> tuple[dict[str, Any], dict[str, Any]]:
     settings: dict[str, Any] = {}
-    display: list[dict[str, Any]] = []
+    display: dict[str, Any] = {}
     for item in items:
         if "=" not in item:
             raise ProtocolError(f"Setting assignment {item!r} must use name=value.")
         name, text = item.split("=", 1)
+        if name == "sleep_interval_seconds":
+            name = "ble_check_interval_seconds"
         definition = SETTINGS_BY_NAME.get(name)
         if definition is None:
             raise ProtocolError(f"Unknown setting {name!r}.")
@@ -38,8 +40,13 @@ def parse_assignments(items: list[str]) -> tuple[dict[str, Any], list[dict[str, 
             raise ProtocolError(f"Duplicate setting {name!r}.")
         value = parse_cli_setting_value(definition, text)
         settings[name] = value
-        display_value = value.hex().upper() if isinstance(value, (bytes, bytearray)) else value
-        display.append({"name": name, "value": display_value})
+        display[name] = value.hex().upper() if isinstance(value, (bytes, bytearray)) else value
+    missing = set(SETTINGS_BY_NAME) - set(settings)
+    if missing:
+        raise ProtocolError(
+            "Canonical configuration updates are full replacement packets. Missing --set values: "
+            + ", ".join(sorted(missing))
+        )
     return settings, display
 
 
@@ -60,14 +67,15 @@ def build_from_args(args: argparse.Namespace) -> tuple[bytes, list[dict[str, Any
 
 
 def make_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Generate and queue Micro SETTINGS_UPDATE packets.")
+    parser = argparse.ArgumentParser(description="Generate and queue canonical command-0x02 Micro configuration updates.")
     parser.add_argument("--store", type=pathlib.Path, default=DEFAULT_STORE)
     sub = parser.add_subparsers(dest="command", required=True)
 
     for name in ("generate", "queue"):
         cmd = sub.add_parser(name)
         cmd.add_argument("--imei", required=True)
-        cmd.add_argument("--set", dest="set_values", action="append", required=True, metavar="NAME=VALUE")
+        cmd.add_argument("--set", dest="set_values", action="append", required=True, metavar="NAME=VALUE",
+                         help="Repeat for all seven full-replacement fields. Lists are concatenated HEX.")
         cmd.add_argument("--update-id", type=int)
         cmd.add_argument("--sequence-id", type=int, default=1)
 
@@ -95,13 +103,8 @@ def main() -> int:
         if args.command == "registry":
             rows = [
                 {
-                    "id": f"0x{item.setting_id:02X}",
                     "name": item.name,
-                    "type": f"0x{item.value_type:02X}",
-                    "minimum": item.minimum,
-                    "maximum": item.maximum,
-                    "default": item.default.hex().upper() if isinstance(item.default, bytes) else item.default,
-                    "persistent": item.persistent,
+                    "kind": item.kind,
                     "description": item.description,
                 }
                 for item in SETTINGS

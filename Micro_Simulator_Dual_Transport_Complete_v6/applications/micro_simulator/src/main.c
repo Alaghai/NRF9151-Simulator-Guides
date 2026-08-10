@@ -75,6 +75,7 @@ LOG_MODULE_REGISTER(micro_simulator, LOG_LEVEL_INF);
 #define TCP_UPDATE_WAIT_MS 5000
 #define RELAY_PREFIX_MAX 64
 #define MICRO_HEARTBEAT_STACK_SIZE 4096
+#define MICRO_STATE_MACHINE_STACK_SIZE 3072
 
 K_SEM_DEFINE(lte_connected, 0, 1);
 
@@ -85,10 +86,10 @@ static const struct device *const uart_dev = DEVICE_DT_GET(DT_NODELABEL(uart0));
  * serialized big-endian.
  */
 static const char SAMPLE_HB_BEACON[] =
-    "AB10002569FD0001013836313335323036343035303738370000019F84DE77C0010107FF0101010FAC91003B91";
+    "AB10003E621D0001013836313335323036343035303738370000019F84DE77C0010107FF0101010FAC91003B9101AABBCCDDEE01000000000000000000000000000000000000";
 
 static const char SAMPLE_HB_GPS[] =
-    "AB10002BFA890001013836313335323036343035303738370000019F84DE77C0010107FF01011002B513BCFB7CF3D000FF0000";
+    "AB10004464B10001013836313335323036343035303738370000019F84DE77C0010107FF01011002B513BCFB7CF3D000FF000001AABBCCDDEE01000000000000000000000000000000000000";
 
 static const char SAMPLE_LOCATION[] =
     "AB10002867C80001103836313335323036343035303738370000019F84DE77C0010107FF02B513BCFB7CF3D000FF0000";
@@ -112,6 +113,21 @@ enum heartbeat_opcode {
     OPCODE_GPS_SAFEZONE = 0x0A,
     OPCODE_GPS_LTE = 0x10,
     OPCODE_TRUSTED = 0xA0,
+};
+
+/* Configuration mode is deliberately quiet: it lets a tester inspect or
+ * replace the persistent configuration without starting network activity.
+ * Runtime simulation is an explicit opt-in mode. */
+enum simulator_operation_mode {
+    SIMULATOR_CONFIGURATION_MODE = 0,
+    SIMULATOR_RUNTIME_MODE = 1,
+};
+
+enum device_tracking_state {
+    DEVICE_STATE_BEACON = 0,
+    DEVICE_STATE_TRUSTED_DEVICE,
+    DEVICE_STATE_GPS_SAFE_ZONE,
+    DEVICE_STATE_GPS_LTE_OUTSIDE,
 };
 
 enum timestamp_mode {
@@ -143,6 +159,8 @@ struct sim_state {
     uint8_t sw_version;
     uint8_t fw_version;
     uint8_t opcode;
+    enum simulator_operation_mode operation_mode;
+    enum device_tracking_state tracking_state;
 
     enum timestamp_mode timestamp_mode;
     uint64_t timestamp_base_ms;
@@ -157,6 +175,8 @@ struct sim_state {
 
     uint8_t beacon_mac[6];
     uint8_t trusted_addr[6]; /* currently detected trusted-device identity */
+    bool beacon_detected;
+    bool trusted_device_detected;
 };
 
 static struct sim_state state = {
@@ -179,6 +199,8 @@ static struct sim_state state = {
     .sw_version = 1,
     .fw_version = 1,
     .opcode = OPCODE_BEACON,
+    .operation_mode = SIMULATOR_CONFIGURATION_MODE,
+    .tracking_state = DEVICE_STATE_BEACON,
     .timestamp_mode = TIMESTAMP_FIXED,
     .timestamp_base_ms = DEFAULT_TIMESTAMP_UNIX_MS,
     .timestamp_base_uptime_ms = 0,
@@ -190,6 +212,8 @@ static struct sim_state state = {
     .speed_x10 = 0,
     .beacon_mac = {0x0F, 0xAC, 0x91, 0x00, 0x3B, 0x91},
     .trusted_addr = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01},
+    .beacon_detected = true,
+    .trusted_device_detected = true,
 };
 
 
@@ -232,12 +256,28 @@ static char cli_line[CLI_LINE_MAX];
 
 K_MUTEX_DEFINE(micro_transport_mutex);
 K_SEM_DEFINE(micro_heartbeat_trigger, 0, 1);
+K_SEM_DEFINE(micro_state_reevaluation_trigger, 0, 1);
+K_SEM_DEFINE(micro_lte_location_trigger, 0, 1);
 
 static void heartbeat_timer_expiry(struct k_timer *timer);
 K_TIMER_DEFINE(micro_heartbeat_timer, heartbeat_timer_expiry, NULL);
+static void ble_check_timer_expiry(struct k_timer *timer);
+K_TIMER_DEFINE(micro_ble_check_timer, ble_check_timer_expiry, NULL);
+static void lte_location_timer_expiry(struct k_timer *timer);
+K_TIMER_DEFINE(micro_lte_location_timer, lte_location_timer_expiry, NULL);
+
+static bool heartbeat_timer_armed;
+static bool ble_check_timer_armed;
+static bool lte_location_timer_armed;
 
 static void heartbeat_thread(void *p1, void *p2, void *p3);
 K_THREAD_DEFINE(micro_heartbeat, MICRO_HEARTBEAT_STACK_SIZE, heartbeat_thread,
+                NULL, NULL, NULL, 5, 0, 0);
+static void state_machine_thread(void *p1, void *p2, void *p3);
+K_THREAD_DEFINE(micro_state_machine, MICRO_STATE_MACHINE_STACK_SIZE, state_machine_thread,
+                NULL, NULL, NULL, 5, 0, 0);
+static void lte_location_thread(void *p1, void *p2, void *p3);
+K_THREAD_DEFINE(micro_lte_location, MICRO_STATE_MACHINE_STACK_SIZE, lte_location_thread,
                 NULL, NULL, NULL, 5, 0, 0);
 
 static k_tid_t micro_main_thread;
@@ -260,8 +300,12 @@ static int modem_prepare(void);
 static int lte_connect_start(void);
 static int process_server_response_bytes(const uint8_t *data, size_t len, const char *source);
 static void schedule_next_heartbeat(void);
+static void schedule_ble_checks(void);
+static void schedule_lte_location_updates(bool send_now);
+static void request_state_reevaluation(void);
 static int apply_settings_packet_bytes(const uint8_t *packet, size_t packet_len, const char *source);
 static void print_hex6(const uint8_t v[6]);
+static void print_persistent_config(void);
 
 
 static void drain_logs_and_reboot(void)
@@ -726,6 +770,10 @@ static int persistent_settings_init(void)
             return err;
         }
     }
+    next_update_id = (uint16_t)(active_config.last_update_id + 1U);
+    if (next_update_id == 0U) {
+        next_update_id = 1U;
+    }
     return 0;
 }
 
@@ -746,9 +794,7 @@ static void record_config_result(int status, const char *source,
 
 static void append_imei(uint8_t *buf, size_t *len)
 {
-    /* Protocol document states 16 bytes but examples show 15 ASCII digits.
-     * Use 15 ASCII digits to match current example strings.
-     */
+    /* Canonical Version 7 uses exactly 15 ASCII decimal digits. */
     size_t imei_len = strlen(state.imei);
     if (imei_len > 15) {
         imei_len = 15;
@@ -957,8 +1003,8 @@ static int build_settings_update_hex(const char *name, const char *value,
     uint8_t *payload = transport_buffers.payload;
     size_t payload_len = 0U;
     uint16_t update_id = next_update_id++;
-    int err = micro_settings_build_single_payload(state.imei, update_id,
-                                                  name, value,
+    int err = micro_settings_build_config_with_override_payload(state.imei, update_id,
+                                                  &active_config, name, value,
                                                   payload, MAX_PACKET_BYTES,
                                                   &payload_len);
     if (err != 0) {
@@ -1032,23 +1078,23 @@ static void print_settings_changes(const struct micro_persistent_config *previou
             printk("setting %s: %u -> %u\r\n", name,
                    previous->lte_update_interval_seconds,
                    current->lte_update_interval_seconds);
-        } else if (id == MICRO_SETTING_SLEEP_INTERVAL) {
+        } else if (id == MICRO_SETTING_BLE_CHECK_INTERVAL) {
             printk("setting %s: %u -> %u\r\n", name,
-                   previous->sleep_interval_seconds,
-                   current->sleep_interval_seconds);
+                   previous->ble_check_interval_seconds,
+                   current->ble_check_interval_seconds);
         } else if (id == MICRO_SETTING_SAFE_ZONES) {
             printk("setting %s count: %u -> %u\r\n", name,
                    previous->zone_count, current->zone_count);
             for (uint8_t i = 0U; i < previous->zone_count; ++i) {
-                printk("  old[%u]: lat_e7=%d lon_e7=%d radius_m=%u\r\n", i + 1U,
-                       previous->zones[i].latitude_e7,
-                       previous->zones[i].longitude_e7,
+                printk("  old[%u]: lat_e6=%d lon_e6=%d radius_m=%u\r\n", i + 1U,
+                       previous->zones[i].latitude_e6,
+                       previous->zones[i].longitude_e6,
                        previous->zones[i].radius_m);
             }
             for (uint8_t i = 0U; i < current->zone_count; ++i) {
-                printk("  new[%u]: lat_e7=%d lon_e7=%d radius_m=%u\r\n", i + 1U,
-                       current->zones[i].latitude_e7,
-                       current->zones[i].longitude_e7,
+                printk("  new[%u]: lat_e6=%d lon_e6=%d radius_m=%u\r\n", i + 1U,
+                       current->zones[i].latitude_e6,
+                       current->zones[i].longitude_e6,
                        current->zones[i].radius_m);
             }
         } else if (id == MICRO_SETTING_BEACON_LIST) {
@@ -1069,6 +1115,9 @@ static void print_settings_changes(const struct micro_persistent_config *previou
             for (uint8_t i = 0U; i < current->trusted_device_count; ++i) {
                 printk("  new[%u]: ", i + 1U); print_hex6(current->trusted_devices[i]); printk("\r\n");
             }
+        } else if (id == MICRO_SETTING_SENDING_UPDATE) {
+            printk("setting %s: 0x%02X -> 0x%02X\r\n", name,
+                   previous->sending_update, current->sending_update);
         }
     }
 }
@@ -1135,6 +1184,18 @@ static int apply_settings_packet_bytes(const uint8_t *packet, size_t packet_len,
     if (ctx->previous.heartbeat_interval_seconds != active_config.heartbeat_interval_seconds) {
         schedule_next_heartbeat();
     }
+    if (ctx->previous.ble_check_interval_seconds != active_config.ble_check_interval_seconds) {
+        schedule_ble_checks();
+    }
+    if (ctx->previous.lte_update_interval_seconds != active_config.lte_update_interval_seconds &&
+        state.tracking_state == DEVICE_STATE_GPS_LTE_OUTSIDE) {
+        schedule_lte_location_updates(false);
+    }
+    /* A full-replacement update can change the configured BLE/GNSS context.
+     * Evaluate it immediately; this is what makes a lost-person update take
+     * effect without waiting for the next BLE interval. */
+    request_state_reevaluation();
+    print_persistent_config();
     return 0;
 }
 
@@ -1146,6 +1207,7 @@ static void tcp_disconnect(void)
     state.tcp_fd = -1;
     state.tcp_connected = false;
     (void)k_timer_stop(&micro_heartbeat_timer);
+    heartbeat_timer_armed = false;
     printk("TCP disconnected\r\n");
 }
 
@@ -1413,6 +1475,7 @@ static void relay_disconnect(void)
     }
     state.relay_connected = false;
     (void)k_timer_stop(&micro_heartbeat_timer);
+    heartbeat_timer_armed = false;
     printk("Relay disconnected\r\n");
 }
 
@@ -1507,28 +1570,201 @@ static void log_relevant_stack_usage(const char *phase)
     printk("STACK SNAPSHOT: %s\r\n", phase);
     log_thread_stack_usage(phase, micro_main_thread);
     log_thread_stack_usage(phase, micro_heartbeat);
+    log_thread_stack_usage(phase, micro_state_machine);
+    log_thread_stack_usage(phase, micro_lte_location);
     log_thread_stack_usage(phase, k_work_queue_thread_get(&k_sys_work_q));
 
 }
 
 static void schedule_next_heartbeat(void)
 {
-    if (!transport_is_connected()) {
-        (void)k_timer_stop(&micro_heartbeat_timer);
+    (void)k_timer_stop(&micro_heartbeat_timer);
+    heartbeat_timer_armed = false;
+    if (state.operation_mode != SIMULATOR_RUNTIME_MODE || !transport_is_connected()) {
         return;
     }
     uint32_t interval = active_config.heartbeat_interval_seconds;
-    if (interval == 0U) {
-        interval = 60U;
-    }
     (void)k_timer_start(&micro_heartbeat_timer, K_SECONDS(interval), K_NO_WAIT);
+    heartbeat_timer_armed = true;
     printk("Next automatic heartbeat scheduled in %u seconds\r\n", interval);
 }
 
 static void heartbeat_timer_expiry(struct k_timer *timer)
 {
     ARG_UNUSED(timer);
+    heartbeat_timer_armed = false;
     k_sem_give(&micro_heartbeat_trigger);
+}
+
+static void schedule_ble_checks(void)
+{
+    (void)k_timer_stop(&micro_ble_check_timer);
+    ble_check_timer_armed = false;
+    if (state.operation_mode != SIMULATOR_RUNTIME_MODE) {
+        return;
+    }
+    uint32_t interval = active_config.ble_check_interval_seconds;
+    (void)k_timer_start(&micro_ble_check_timer, K_SECONDS(interval), K_SECONDS(interval));
+    ble_check_timer_armed = true;
+    printk("BLE context reevaluation scheduled every %u seconds\r\n", interval);
+}
+
+static void schedule_lte_location_updates(bool send_now)
+{
+    (void)k_timer_stop(&micro_lte_location_timer);
+    lte_location_timer_armed = false;
+    if (state.operation_mode != SIMULATOR_RUNTIME_MODE ||
+        state.tracking_state != DEVICE_STATE_GPS_LTE_OUTSIDE) {
+        return;
+    }
+    uint32_t interval = active_config.lte_update_interval_seconds;
+    (void)k_timer_start(&micro_lte_location_timer, K_SECONDS(interval), K_SECONDS(interval));
+    lte_location_timer_armed = true;
+    printk("LTE location updates scheduled every %u seconds while outside\r\n", interval);
+    if (send_now) {
+        k_sem_give(&micro_lte_location_trigger);
+    }
+}
+
+static void request_state_reevaluation(void)
+{
+    if (state.operation_mode == SIMULATOR_RUNTIME_MODE) {
+        k_sem_give(&micro_state_reevaluation_trigger);
+    }
+}
+
+static void ble_check_timer_expiry(struct k_timer *timer)
+{
+    ARG_UNUSED(timer);
+    /* BLE expiry changes only local awareness.  It does not directly send a
+     * heartbeat or location packet. */
+    request_state_reevaluation();
+}
+
+static void lte_location_timer_expiry(struct k_timer *timer)
+{
+    ARG_UNUSED(timer);
+    if (state.operation_mode == SIMULATOR_RUNTIME_MODE &&
+        state.tracking_state == DEVICE_STATE_GPS_LTE_OUTSIDE) {
+        k_sem_give(&micro_lte_location_trigger);
+    }
+}
+
+static bool detected_id_is_configured(const uint8_t id[MICRO_DEVICE_ID_BYTES],
+                                      const uint8_t configured[][MICRO_DEVICE_ID_BYTES],
+                                      uint8_t configured_count)
+{
+    for (uint8_t i = 0U; i < configured_count; ++i) {
+        if (memcmp(id, configured[i], MICRO_DEVICE_ID_BYTES) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool current_position_is_inside_safe_zone(void)
+{
+    /* The simulator uses a local planar metres approximation.  It is adequate
+     * for the supplied zone radii and keeps the firmware independent of a
+     * floating-point geodesy library. */
+    for (uint8_t i = 0U; i < active_config.zone_count; ++i) {
+        const struct micro_safe_zone *zone = &active_config.zones[i];
+        int64_t north_m = ((int64_t)state.lat_e6 - zone->latitude_e6) * 111320LL / 1000000LL;
+        int64_t east_m = ((int64_t)state.lon_e6 - zone->longitude_e6) * 111320LL / 1000000LL;
+        int64_t radius_m = zone->radius_m;
+        if ((north_m * north_m) + (east_m * east_m) <= radius_m * radius_m) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static enum device_tracking_state evaluate_device_tracking_state(void)
+{
+    if (state.beacon_detected &&
+        detected_id_is_configured(state.beacon_mac, active_config.beacons,
+                                  active_config.beacon_count)) {
+        return DEVICE_STATE_BEACON;
+    }
+    if (state.trusted_device_detected &&
+        detected_id_is_configured(state.trusted_addr, active_config.trusted_devices,
+                                  active_config.trusted_device_count)) {
+        return DEVICE_STATE_TRUSTED_DEVICE;
+    }
+    /* The simulated position is the latest valid GNSS fix.  Only BLE failure
+     * reaches this point, so the heartbeat timer never initiates GNSS work. */
+    state.location_fix_age_seconds = 0U;
+    return current_position_is_inside_safe_zone() ? DEVICE_STATE_GPS_SAFE_ZONE
+                                                  : DEVICE_STATE_GPS_LTE_OUTSIDE;
+}
+
+static uint8_t heartbeat_opcode_for_tracking_state(enum device_tracking_state tracking_state)
+{
+    switch (tracking_state) {
+    case DEVICE_STATE_BEACON: return OPCODE_BEACON;
+    case DEVICE_STATE_TRUSTED_DEVICE: return OPCODE_TRUSTED;
+    case DEVICE_STATE_GPS_SAFE_ZONE: return OPCODE_GPS_SAFEZONE;
+    case DEVICE_STATE_GPS_LTE_OUTSIDE: return OPCODE_GPS_LTE;
+    default: return OPCODE_GPS_LTE;
+    }
+}
+
+static void reevaluate_device_state(void)
+{
+    if (state.operation_mode != SIMULATOR_RUNTIME_MODE) {
+        return;
+    }
+    enum device_tracking_state previous = state.tracking_state;
+    enum device_tracking_state next = evaluate_device_tracking_state();
+    state.tracking_state = next;
+    state.opcode = heartbeat_opcode_for_tracking_state(next);
+    if (next != previous) {
+        printk("State transition: %u -> %u; heartbeat opcode 0x%02X\r\n",
+               previous, next, state.opcode);
+    }
+    if (previous != DEVICE_STATE_GPS_LTE_OUTSIDE && next == DEVICE_STATE_GPS_LTE_OUTSIDE) {
+        schedule_lte_location_updates(true);
+    } else if (previous == DEVICE_STATE_GPS_LTE_OUTSIDE && next != DEVICE_STATE_GPS_LTE_OUTSIDE) {
+        schedule_lte_location_updates(false);
+    }
+}
+
+static void state_machine_thread(void *p1, void *p2, void *p3)
+{
+    ARG_UNUSED(p1);
+    ARG_UNUSED(p2);
+    ARG_UNUSED(p3);
+    (void)k_thread_name_set(k_current_get(), "micro_state");
+    while (true) {
+        (void)k_sem_take(&micro_state_reevaluation_trigger, K_FOREVER);
+        (void)k_mutex_lock(&micro_transport_mutex, K_FOREVER);
+        reevaluate_device_state();
+        (void)k_mutex_unlock(&micro_transport_mutex);
+    }
+}
+
+static void lte_location_thread(void *p1, void *p2, void *p3)
+{
+    ARG_UNUSED(p1);
+    ARG_UNUSED(p2);
+    ARG_UNUSED(p3);
+    (void)k_thread_name_set(k_current_get(), "micro_lte_location");
+    while (true) {
+        (void)k_sem_take(&micro_lte_location_trigger, K_FOREVER);
+        (void)k_mutex_lock(&micro_transport_mutex, K_FOREVER);
+        if (state.operation_mode == SIMULATOR_RUNTIME_MODE &&
+            state.tracking_state == DEVICE_STATE_GPS_LTE_OUTSIDE) {
+            int err = build_location_hex(transport_buffers.hex, sizeof(transport_buffers.hex));
+            if (err == 0) {
+                printk("Automatic LTE location sent: %s\r\n", transport_buffers.hex);
+                err = transport_send_hex_payload(transport_buffers.hex);
+            }
+            if (err != 0) {
+                printk("Automatic LTE location failed: %d\r\n", err);
+            }
+        }
+        (void)k_mutex_unlock(&micro_transport_mutex);
+    }
 }
 
 static void heartbeat_thread(void *p1, void *p2, void *p3)
@@ -1541,7 +1777,7 @@ static void heartbeat_thread(void *p1, void *p2, void *p3)
 
     while (true) {
         (void)k_sem_take(&micro_heartbeat_trigger, K_FOREVER);
-        if (!transport_is_connected()) {
+        if (state.operation_mode != SIMULATOR_RUNTIME_MODE || !transport_is_connected()) {
             continue;
         }
 
@@ -1795,10 +2031,11 @@ static void print_help(void)
     printk("  config set <setting_name> <value>\r\n");
     printk("  config reset confirm\r\n");
     printk("  config last\r\n");
+    printk("  simulation status|on|off\r\n");
     printk("  preset normal|low|charging|outside|beacon|trusted\r\n");
     printk("  set battery low|medium|high\r\n");
     printk("  set charging on|off\r\n");
-    printk("  set opcode beacon|trusted|gps_lte|gps_safezone\r\n");
+    printk("  set opcode beacon|trusted|gps_lte|gps_safezone (diagnostic only)\r\n");
     printk("  set pos <lat> <lon> <accuracy_m> <speed_mps>\r\n");
     printk("  set imei <digits>\r\n");
     printk("  set lastupdate <minutes>\r\n");
@@ -1807,8 +2044,8 @@ static void print_help(void)
     printk("  set time_step <milliseconds>\r\n");
     printk("  set fixage <seconds>\r\n");
     printk("  set versions <sw> <fw>\r\n");
-    printk("  set beacon <12_hex_chars>\r\n");
-    printk("  set trusted <12_hex_chars>\r\n\r\n");
+    printk("  set beacon <12_hex_chars>|off\r\n");
+    printk("  set trusted <12_hex_chars>|off\r\n\r\n");
 }
 
 static void print_hex6(const uint8_t v[6])
@@ -1818,37 +2055,73 @@ static void print_hex6(const uint8_t v[6])
     }
 }
 
+static void print_coordinate_e6(int32_t value)
+{
+    int32_t magnitude = value < 0 ? -value : value;
+    printk("%s%d.%06d", value < 0 ? "-" : "", magnitude / 1000000,
+           magnitude % 1000000);
+}
+
 static void print_status(void)
 {
-    printk("\r\nStatus:\r\n");
+    printk("\r\nSimulator status (non-secret state only):\r\n");
     printk("  transport: %s\r\n", transport_name());
     printk("  SoftSIM: %s\r\n", softsim_status_name());
     printk("  LTE: %s\r\n", lte_status_name());
-    printk("  LTE TCP: %s\r\n", state.tcp_connected ? "connected" : "disconnected");
-    printk("  Windows relay: %s\r\n", state.relay_connected ? "connected" : "disconnected");
-    printk("  server: %s:%u\r\n", state.server_ip, state.server_port);
-    printk("  mode: %s\r\n", mode_name());
-    printk("  sequence_id: %u\r\n", state.sequence_id);
+    printk("  TCP connection: %s\r\n", state.tcp_connected ? "connected" : "disconnected");
+    printk("  Windows relay connection: %s\r\n", state.relay_connected ? "connected" : "disconnected");
+    printk("  TCP server: %s:%u\r\n", state.server_ip, state.server_port);
+    printk("  wire mode: %s\r\n", mode_name());
+    printk("  current sequence ID: %u\r\n", state.sequence_id);
     printk("  imei: %s\r\n", state.imei);
-    printk("  battery: 0x%02X\r\n", state.battery);
-    printk("  charging: 0x%02X\r\n", state.charging);
-    printk("  last_update: %u minutes\r\n", state.last_update);
-    printk("  timestamp: %llu ms since Unix epoch (UTC)\r\n",
+    printk("  software version: %u; firmware version: %u\r\n", state.sw_version, state.fw_version);
+    printk("  last successfully applied update ID: %u\r\n", active_config.last_update_id);
+    printk("  lastUpdate: %u minutes\r\n", state.last_update);
+    printk("  battery state: 0x%02X; charging state: 0x%02X\r\n", state.battery, state.charging);
+    printk("  operation mode: %s\r\n",
+           state.operation_mode == SIMULATOR_RUNTIME_MODE ? "runtime simulation" : "configuration only (default)");
+    printk("  current runtime state: %s\r\n",
+           state.tracking_state == DEVICE_STATE_BEACON ? "BEACON" :
+           state.tracking_state == DEVICE_STATE_TRUSTED_DEVICE ? "TRUSTED_DEVICE" :
+           state.tracking_state == DEVICE_STATE_GPS_SAFE_ZONE ? "GPS_SAFE_ZONE" : "GPS_LTE_OUTSIDE");
+    printk("  current heartbeat opcode: 0x%02X (%s)\r\n", state.opcode, opcode_name(state.opcode));
+    printk("  current simulated time: %llu ms since Unix epoch (UTC)\r\n",
            (unsigned long long)simulated_current_time_ms());
-    printk("  time_mode: %s; step=%llu ms; location_fix_age=%u s\r\n",
+    printk("  time simulation: %s; step=%llu ms; location fix age=%u s\r\n",
            timestamp_mode_name(),
            (unsigned long long)state.timestamp_step_ms,
            state.location_fix_age_seconds);
-    printk("  versions: sw=%u fw=%u\r\n", state.sw_version, state.fw_version);
-    printk("  opcode: 0x%02X (%s)\r\n", state.opcode, opcode_name(state.opcode));
-    printk("  lat_e6: %d lon_e6: %d\r\n", state.lat_e6, state.lon_e6);
-    printk("  accuracy_x10: %u speed_x10: %u\r\n", state.accuracy_x10, state.speed_x10);
-    printk("  beacon: "); print_hex6(state.beacon_mac); printk("\r\n");
-    printk("  detected trusted: "); print_hex6(state.trusted_addr); printk("\r\n");
-    printk("  persistent heartbeat_interval_seconds: %u\r\n", active_config.heartbeat_interval_seconds);
+    printk("  currently detected beacon: %s", state.beacon_detected ? "present " : "absent");
+    if (state.beacon_detected) { print_hex6(state.beacon_mac); }
+    printk("\r\n");
+    printk("  currently detected trusted device: %s", state.trusted_device_detected ? "present " : "absent");
+    if (state.trusted_device_detected) { print_hex6(state.trusted_addr); }
+    printk("\r\n");
+    printk("  latest GPS location: latitude="); print_coordinate_e6(state.lat_e6);
+    printk(" longitude="); print_coordinate_e6(state.lon_e6);
+    printk(" accuracy_m=%u.%u speed_mps=%u.%u\r\n", state.accuracy_x10 / 10U,
+           state.accuracy_x10 % 10U, state.speed_x10 / 10U, state.speed_x10 % 10U);
+    printk("  heartbeat interval: %u seconds; timer=%s\r\n", active_config.heartbeat_interval_seconds,
+           heartbeat_timer_armed ? "scheduled" : "stopped");
+    printk("  BLE check interval: %u seconds; timer=%s\r\n", active_config.ble_check_interval_seconds,
+           ble_check_timer_armed ? "scheduled" : "stopped");
+    printk("  LTE update interval: %u seconds; outside timer=%s\r\n", active_config.lte_update_interval_seconds,
+           lte_location_timer_armed ? "scheduled" : "stopped");
+    printk("  SendingUpdate: 0x%02X (%s)\r\n", active_config.sending_update,
+           active_config.sending_update == 0xFFU ? "firmware update indicated" : "no firmware update");
+    printk("  safe zones: %u\r\n", active_config.zone_count);
+    for (uint8_t i = 0U; i < active_config.zone_count; ++i) {
+        printk("    safe zone %u: latitude=", i + 1U); print_coordinate_e6(active_config.zones[i].latitude_e6);
+        printk(" longitude="); print_coordinate_e6(active_config.zones[i].longitude_e6);
+        printk(" radius_m=%u\r\n", active_config.zones[i].radius_m);
+    }
+    printk("  configured fixed beacons: %u\r\n", active_config.beacon_count);
+    for (uint8_t i = 0U; i < active_config.beacon_count; ++i) {
+        printk("    beacon %u: ", i + 1U); print_hex6(active_config.beacons[i]); printk("\r\n");
+    }
     printk("  configured trusted devices: %u\r\n", active_config.trusted_device_count);
     for (uint8_t i = 0U; i < active_config.trusted_device_count; ++i) {
-        printk("    slot %u: ", i + 1U); print_hex6(active_config.trusted_devices[i]); printk("\r\n");
+        printk("    trusted device %u: ", i + 1U); print_hex6(active_config.trusted_devices[i]); printk("\r\n");
     }
     printk("\r\n");
 }
@@ -1858,7 +2131,8 @@ static void apply_preset(const char *preset)
     if (strcmp(preset, "normal") == 0) {
         state.battery = 0x01;
         state.charging = 0x01;
-        state.opcode = OPCODE_BEACON;
+        state.beacon_detected = true;
+        state.trusted_device_detected = true;
     } else if (strcmp(preset, "low") == 0) {
         state.battery = 0x00;
         state.charging = 0x01;
@@ -1866,21 +2140,25 @@ static void apply_preset(const char *preset)
         state.battery = 0x01;
         state.charging = 0x10;
     } else if (strcmp(preset, "outside") == 0) {
-        state.opcode = OPCODE_GPS_LTE;
+        state.beacon_detected = false;
+        state.trusted_device_detected = false;
         state.lat_e6 = 45450000;
         state.lon_e6 = -75750000;
         state.accuracy_x10 = 300;
         state.speed_x10 = 12;
     } else if (strcmp(preset, "beacon") == 0) {
-        state.opcode = OPCODE_BEACON;
+        state.beacon_detected = true;
+        state.trusted_device_detected = false;
     } else if (strcmp(preset, "trusted") == 0) {
-        state.opcode = OPCODE_TRUSTED;
+        state.beacon_detected = false;
+        state.trusted_device_detected = true;
     } else {
         printk("Unknown preset: %s\r\n", preset);
         return;
     }
 
     printk("Applied preset: %s\r\n", preset);
+    request_state_reevaluation();
 }
 
 static char *trim_left(char *s)
@@ -1985,13 +2263,14 @@ static void handle_set_command(char *args)
         printk("charging set\r\n");
     } else if (strcmp(field, "opcode") == 0) {
         char *v = strtok(NULL, " ");
-        if (!v) { printk("Usage: set opcode beacon|trusted|gps_lte|gps_safezone\r\n"); return; }
-        if (strcmp(v, "beacon") == 0) state.opcode = OPCODE_BEACON;
-        else if (strcmp(v, "trusted") == 0) state.opcode = OPCODE_TRUSTED;
-        else if (strcmp(v, "gps_lte") == 0) state.opcode = OPCODE_GPS_LTE;
-        else if (strcmp(v, "gps_safezone") == 0) state.opcode = OPCODE_GPS_SAFEZONE;
+        if (!v) { printk("Usage: set opcode beacon|trusted|gps_lte|gps_safezone (diagnostic only)\r\n"); return; }
+        if (strcmp(v, "beacon") == 0) { state.opcode = OPCODE_BEACON; state.tracking_state = DEVICE_STATE_BEACON; }
+        else if (strcmp(v, "trusted") == 0) { state.opcode = OPCODE_TRUSTED; state.tracking_state = DEVICE_STATE_TRUSTED_DEVICE; }
+        else if (strcmp(v, "gps_lte") == 0) { state.opcode = OPCODE_GPS_LTE; state.tracking_state = DEVICE_STATE_GPS_LTE_OUTSIDE; }
+        else if (strcmp(v, "gps_safezone") == 0) { state.opcode = OPCODE_GPS_SAFEZONE; state.tracking_state = DEVICE_STATE_GPS_SAFE_ZONE; }
         else { printk("Invalid opcode\r\n"); return; }
-        printk("opcode set to %s\r\n", opcode_name(state.opcode));
+        printk("diagnostic opcode set to %s; runtime simulation will derive it at the next BLE check\r\n",
+               opcode_name(state.opcode));
     } else if (strcmp(field, "pos") == 0) {
         char *lat = strtok(NULL, " ");
         char *lon = strtok(NULL, " ");
@@ -2018,6 +2297,7 @@ static void handle_set_command(char *args)
         state.accuracy_x10 = (uint16_t)acc_x10;
         state.speed_x10 = (uint16_t)spd_x10;
         printk("position set\r\n");
+        request_state_reevaluation();
     } else if (strcmp(field, "imei") == 0) {
         char *v = strtok(NULL, " ");
         if (!v || strlen(v) != 15) {
@@ -2103,12 +2383,28 @@ static void handle_set_command(char *args)
         printk("versions set\r\n");
     } else if (strcmp(field, "beacon") == 0) {
         char *v = strtok(NULL, " ");
-        if (!v || parse_hex6(v, state.beacon_mac)) { printk("Usage: set beacon <12_hex_chars>\r\n"); return; }
-        printk("beacon set\r\n");
+        if (!v) { printk("Usage: set beacon <12_hex_chars>|off\r\n"); return; }
+        if (strcmp(v, "off") == 0) {
+            state.beacon_detected = false;
+        } else if (parse_hex6(v, state.beacon_mac)) {
+            printk("Usage: set beacon <12_hex_chars>|off\r\n"); return;
+        } else {
+            state.beacon_detected = true;
+        }
+        printk("beacon detection updated\r\n");
+        request_state_reevaluation();
     } else if (strcmp(field, "trusted") == 0) {
         char *v = strtok(NULL, " ");
-        if (!v || parse_hex6(v, state.trusted_addr)) { printk("Usage: set trusted <12_hex_chars>\r\n"); return; }
-        printk("trusted set\r\n");
+        if (!v) { printk("Usage: set trusted <12_hex_chars>|off\r\n"); return; }
+        if (strcmp(v, "off") == 0) {
+            state.trusted_device_detected = false;
+        } else if (parse_hex6(v, state.trusted_addr)) {
+            printk("Usage: set trusted <12_hex_chars>|off\r\n"); return;
+        } else {
+            state.trusted_device_detected = true;
+        }
+        printk("trusted-device detection updated\r\n");
+        request_state_reevaluation();
     } else {
         printk("Unknown field: %s\r\n", field);
     }
@@ -2118,17 +2414,22 @@ static void handle_set_command(char *args)
 static void print_persistent_config(void)
 {
     printk("\r\nPersistent configuration:\r\n");
+    printk("  target_device_imei: %s\r\n", state.imei);
+    printk("  last_successful_update_id: %u\r\n", active_config.last_update_id);
     printk("  heartbeat_interval_seconds: %u (range 1..65535; default 60)\r\n",
            active_config.heartbeat_interval_seconds);
     printk("  lte_update_interval_seconds: %u (range 1..65535; default 480)\r\n",
            active_config.lte_update_interval_seconds);
-    printk("  sleep_interval_seconds: %u (range 1..65535; default 480)\r\n",
-           active_config.sleep_interval_seconds);
+    printk("  ble_check_interval_seconds: %u (range 1..65535; default 480)\r\n",
+           active_config.ble_check_interval_seconds);
+    printk("  legacy CLI alias: sleep_interval_seconds maps to ble_check_interval_seconds\r\n");
+    printk("  sending_update: 0x%02X (%s)\r\n", active_config.sending_update,
+           active_config.sending_update == 0xFFU ? "firmware update indicated" : "no firmware update");
     printk("  safe_zones: %u\r\n", active_config.zone_count);
     for (uint8_t i = 0U; i < active_config.zone_count; ++i) {
-        printk("    %u: lat_e7=%d lon_e7=%d radius_m=%u\r\n", i + 1U,
-               active_config.zones[i].latitude_e7,
-               active_config.zones[i].longitude_e7,
+        printk("    %u: lat_e6=%d lon_e6=%d radius_m=%u\r\n", i + 1U,
+               active_config.zones[i].latitude_e6,
+               active_config.zones[i].longitude_e6,
                active_config.zones[i].radius_m);
     }
     printk("  beacons: %u\r\n", active_config.beacon_count);
@@ -2160,6 +2461,38 @@ static void print_last_config_update(void)
     if (last_config_error[0] != '\0') {
         printk("  validation_error: %s\r\n", last_config_error);
     }
+}
+
+static void handle_simulation_command(char *args)
+{
+    char *action = NULL;
+    char *tail = NULL;
+    split_first(args ? args : "", &action, &tail);
+    if (action == NULL || strcmp(action, "status") == 0) {
+        printk("Simulation mode: %s\r\n",
+               state.operation_mode == SIMULATOR_RUNTIME_MODE ? "runtime enabled" : "configuration only");
+        return;
+    }
+    if (strcmp(action, "on") == 0) {
+        state.operation_mode = SIMULATOR_RUNTIME_MODE;
+        schedule_ble_checks();
+        schedule_next_heartbeat();
+        request_state_reevaluation();
+        printk("Runtime simulation enabled. BLE state is being evaluated now.\r\n");
+        return;
+    }
+    if (strcmp(action, "off") == 0) {
+        state.operation_mode = SIMULATOR_CONFIGURATION_MODE;
+        (void)k_timer_stop(&micro_heartbeat_timer);
+        (void)k_timer_stop(&micro_ble_check_timer);
+        (void)k_timer_stop(&micro_lte_location_timer);
+        heartbeat_timer_armed = false;
+        ble_check_timer_armed = false;
+        lte_location_timer_armed = false;
+        printk("Runtime simulation disabled. Persistent configuration remains unchanged.\r\n");
+        return;
+    }
+    printk("Usage: simulation status|on|off\r\n");
 }
 
 static void handle_config_command(char *args)
@@ -2423,6 +2756,8 @@ static void handle_command(char *line)
         handle_set_command(rest ? rest : "");
     } else if (strcmp(cmd, "config") == 0) {
         handle_config_command(rest ? rest : "");
+    } else if (strcmp(cmd, "simulation") == 0) {
+        handle_simulation_command(rest ? rest : "");
     } else {
         printk("Unknown command: %s. Type: help\r\n", cmd);
     }
