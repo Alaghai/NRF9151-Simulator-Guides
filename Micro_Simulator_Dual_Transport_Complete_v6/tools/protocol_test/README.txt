@@ -42,6 +42,13 @@ In Anaconda Prompt or PowerShell:
 
   python -m unittest -v
 
+The logging-capacity regression is also included and can be run alone:
+
+  python -m unittest -v test_micro_logging_config
+
+Input: applications/micro_simulator/prj.conf. Output: a pass/fail check that
+the deferred logger ring has at least 16384 bytes of burst headroom.
+
 Run the host C settings test
 ----------------------------
 On Linux/macOS, or a shell with a C compiler in PATH:
