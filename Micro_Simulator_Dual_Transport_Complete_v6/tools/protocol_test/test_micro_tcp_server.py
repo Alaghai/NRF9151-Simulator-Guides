@@ -5,7 +5,8 @@ import tempfile
 import unittest
 
 from micro_pending_store import PendingUpdateStore
-from micro_protocol import OPCODE_BEACON, build_heartbeat_packet, build_settings_update_packet, default_settings
+from micro_protocol import (OPCODE_BEACON, build_heartbeat_packet, build_settings_update_packet,
+                            decode_application_packet, default_settings)
 from micro_response_parser import ServerResponseParser
 from micro_tcp_server import MicroStreamParser, decide_response
 
@@ -70,7 +71,7 @@ class AutoResponseTests(unittest.TestCase):
     def test_pending_update_is_imei_specific_and_persists(self) -> None:
         packet = update(); self.store.queue_packet(imei=IMEI, packet=packet)
         decision = decide_response("AUTO", heartbeat(), store=self.store)
-        self.assertEqual(decision.response, b"SUP\n" + packet)
+        self.assertEqual(decision.response, packet)
         self.assertEqual(decision.pending_update_id, 55)
         self.assertEqual(decide_response("AUTO", heartbeat(OTHER_IMEI), store=self.store).response, b"OK\n")
         reopened = PendingUpdateStore(self.store.path)
@@ -85,20 +86,20 @@ class AutoResponseTests(unittest.TestCase):
 
 
 class ResponseParserTests(unittest.TestCase):
-    def test_split_token_same_read_fragmented_packet_and_buffered_bytes(self) -> None:
+    def test_ok_and_fragmented_binary_update_and_buffered_bytes(self) -> None:
         packet = update(); parser = ServerResponseParser()
-        self.assertEqual(parser.feed(b"S"), [])
-        self.assertEqual([event.kind for event in parser.feed(b"UP\n" + packet[:10])], ["SUP"])
+        self.assertEqual([event.kind for event in parser.feed(b"OK\n")], ["OK"])
+        self.assertEqual(parser.feed(packet[:10]), [])
         events = parser.feed(packet[10:] + b"OK\n")
         self.assertEqual([event.kind for event in events], ["SETTINGS_PACKET", "OK"])
 
     def test_connection_closure_and_timeout_during_update(self) -> None:
-        parser = ServerResponseParser(); parser.feed(b"SUP\n" + update()[:5])
+        parser = ServerResponseParser(); parser.feed(update()[:5])
         self.assertEqual(parser.connection_closed().kind, "INCOMPLETE_SETTINGS")
-        parser = ServerResponseParser(); parser.feed(b"SUP\n" + update()[:7])
+        parser = ServerResponseParser(); parser.feed(update()[:7])
         self.assertEqual(parser.timeout().kind, "SETTINGS_TIMEOUT")
 
-    def test_partner_v8_hex_1_canonical_and_direct_delivery_match(self) -> None:
+    def test_partner_v8_hex_1_canonical_direct_delivery(self) -> None:
         packet = bytes.fromhex(V8_HEX_1)
         decoded = decode_application_packet(packet, target_imei=IMEI)
         self.assertTrue(decoded["valid"], decoded["errors"])
@@ -107,17 +108,17 @@ class ResponseParserTests(unittest.TestCase):
         self.assertEqual((update["gps_safe_zone_count"], update["beacon_count"], update["trusted_device_count"]), (3, 2, 3))
         self.assertEqual((update["heartbeat_interval_seconds"], update["lte_update_interval_seconds"], update["ble_check_interval_seconds"]), (80, 90, 550))
 
-        canonical = ServerResponseParser()
-        self.assertEqual(canonical.feed(b"SU"), [])
-        self.assertEqual([event.kind for event in canonical.feed(b"P\n" + packet[:17])], ["SUP"])
-        canonical_events = canonical.feed(packet[17:])
-        self.assertEqual([event.kind for event in canonical_events], ["SETTINGS_PACKET"])
+        parser = ServerResponseParser()
+        self.assertEqual(parser.feed(packet[:17]), [])
+        events = parser.feed(packet[17:])
+        self.assertEqual([event.kind for event in events], ["SETTINGS_PACKET"])
+        self.assertEqual(events[0].packet, packet)
 
-        direct = ServerResponseParser()
-        self.assertEqual(direct.feed(packet[:9]), [])
-        direct_events = direct.feed(packet[9:])
-        self.assertEqual([event.kind for event in direct_events], ["DIRECT_SETTINGS_PACKET"])
-        self.assertEqual(direct_events[0].packet, canonical_events[0].packet)
+        # SUP may still be tolerated for old development servers, but it is no
+        # longer required to enter settings-packet parsing mode.
+        legacy = ServerResponseParser()
+        legacy_events = legacy.feed(b"SUP\n" + packet)
+        self.assertEqual([event.kind for event in legacy_events], ["LEGACY_SUP", "SETTINGS_PACKET"])
 
     def test_partner_v8_hex_2_and_residual_token(self) -> None:
         packet = bytes.fromhex(V8_HEX_2)
@@ -128,15 +129,16 @@ class ResponseParserTests(unittest.TestCase):
         self.assertEqual((update["gps_safe_zone_count"], update["beacon_count"], update["trusted_device_count"]), (3, 2, 2))
         self.assertEqual((update["heartbeat_interval_seconds"], update["lte_update_interval_seconds"], update["ble_check_interval_seconds"]), (95, 220, 600))
         parser = ServerResponseParser()
-        events = parser.feed(b"OK\n" + packet)
-        self.assertEqual([event.kind for event in events], ["OK", "DIRECT_SETTINGS_PACKET"])
+        # Two sequential heartbeat transactions may still be coalesced by TCP into one read.
+        events = parser.feed(packet + b"OK\n")
+        self.assertEqual([event.kind for event in events], ["SETTINGS_PACKET", "OK"])
 
     def test_direct_invalid_crc_and_wrong_imei_remain_invalid(self) -> None:
         packet = bytearray(bytes.fromhex(V8_HEX_1))
         packet[-1] ^= 1
         parser = ServerResponseParser()
         event = parser.feed(bytes(packet))[0]
-        self.assertEqual(event.kind, "DIRECT_SETTINGS_PACKET")
+        self.assertEqual(event.kind, "SETTINGS_PACKET")
         self.assertFalse(decode_application_packet(event.packet, target_imei=IMEI)["valid"])
         self.assertFalse(decode_application_packet(bytes.fromhex(V8_HEX_1), target_imei=OTHER_IMEI)["valid"])
 

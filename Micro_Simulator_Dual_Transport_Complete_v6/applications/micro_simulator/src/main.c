@@ -227,7 +227,6 @@ static uint16_t next_update_id = 1U;
 static bool config_loaded_from_storage;
 
 static size_t server_response_buffer_len;
-static bool awaiting_settings_packet;
 static uint8_t tcp_rx_chunk[SERVER_RESPONSE_MAX];
 
 /* These buffers are shared by serialized TX/CLI/parser work. Keeping them out
@@ -1267,7 +1266,6 @@ static int tcp_connect_to_server(const char *ip, uint16_t port)
 
     printk("TCP connected to %s:%u\r\n", state.server_ip, state.server_port);
     server_response_buffer_len = 0U;
-    awaiting_settings_packet = false;
     /* The RX worker is the sole zsock_recv() owner for this connection. */
     k_sem_give(&micro_tcp_rx_start);
     schedule_next_heartbeat();
@@ -1280,7 +1278,6 @@ static int process_server_response_bytes(const uint8_t *data, size_t len,
     if (len > sizeof(transport_buffers.response) - server_response_buffer_len) {
         printk("Server response buffer overflow; discarding buffered data\r\n");
         server_response_buffer_len = 0U;
-        awaiting_settings_packet = false;
         return -ENOSPC;
     }
     memcpy(&transport_buffers.response[server_response_buffer_len], data, len);
@@ -1288,25 +1285,26 @@ static int process_server_response_bytes(const uint8_t *data, size_t len,
     int events = 0;
 
     while (server_response_buffer_len > 0U) {
-        bool binary_prefix = transport_buffers.response[0] == 0xABU;
-        if (awaiting_settings_packet || binary_prefix) {
+        /* Canonical Version 8 settings delivery is a self-identifying binary
+         * Micro packet.  A pending update starts with AB 10 and carries
+         * command 0x02 at PACKET_COMMAND_OFFSET; no SUP pre-token is needed. */
+        if (transport_buffers.response[0] == 0xABU) {
             if (server_response_buffer_len < 2U) {
                 break;
             }
             if (transport_buffers.response[1] != 0x10U) {
-                printk("%s binary packet has invalid property 0x%02X\r\n",
-                       awaiting_settings_packet ? "Settings packet after SUP" : "Direct server",
+                printk("Server binary packet has invalid property 0x%02X\r\n",
                        transport_buffers.response[1]);
                 memmove(transport_buffers.response, &transport_buffers.response[1],
                         server_response_buffer_len - 1U);
                 server_response_buffer_len--;
-                awaiting_settings_packet = false;
                 events++;
                 continue;
             }
             if (server_response_buffer_len < 4U) {
                 break;
             }
+
             uint16_t declared = read_u16_be(&transport_buffers.response[2]);
             size_t total = PACKET_COMMAND_OFFSET + declared;
             if (declared < 1U || total > MAX_PACKET_BYTES) {
@@ -1314,7 +1312,6 @@ static int process_server_response_bytes(const uint8_t *data, size_t len,
                 memmove(transport_buffers.response, &transport_buffers.response[1],
                         server_response_buffer_len - 1U);
                 server_response_buffer_len--;
-                awaiting_settings_packet = false;
                 events++;
                 continue;
             }
@@ -1322,21 +1319,21 @@ static int process_server_response_bytes(const uint8_t *data, size_t len,
                 break;
             }
 
-            if (transport_buffers.response[PACKET_COMMAND_OFFSET] == MICRO_SETTINGS_COMMAND) {
-                printk("Complete %s configuration packet received from %s (%u bytes)\r\n",
-                       awaiting_settings_packet ? "SUP" : "direct", source, (unsigned int)total);
+            uint8_t command = transport_buffers.response[PACKET_COMMAND_OFFSET];
+            if (command == MICRO_SETTINGS_COMMAND) {
+                printk("Complete command-0x02 configuration packet received from %s (%u bytes)\r\n",
+                       source, (unsigned int)total);
                 int err = apply_settings_packet_bytes(transport_buffers.response, total, source);
                 if (err != 0) {
                     printk("Settings packet rejected: %d\r\n", err);
                 }
             } else {
-                printk("Unexpected direct binary server command 0x%02X discarded\r\n",
-                       transport_buffers.response[PACKET_COMMAND_OFFSET]);
+                printk("Unexpected binary server command 0x%02X discarded\r\n", command);
             }
+
             memmove(transport_buffers.response, &transport_buffers.response[total],
                     server_response_buffer_len - total);
             server_response_buffer_len -= total;
-            awaiting_settings_packet = false;
             events++;
             continue;
         }
@@ -1352,6 +1349,7 @@ static int process_server_response_bytes(const uint8_t *data, size_t len,
         if (!found) {
             break;
         }
+
         size_t token_len = newline;
         while (token_len > 0U &&
                (transport_buffers.response[token_len - 1U] == '\r' ||
@@ -1368,14 +1366,16 @@ static int process_server_response_bytes(const uint8_t *data, size_t len,
         events++;
 
         if (strcmp(transport_buffers.token, "OK") == 0) {
-            printk("OK received: packet accepted; no settings update pending\r\n");
+            printk("OK received: heartbeat accepted; no configuration update pending\r\n");
         } else if (strncmp(transport_buffers.token, "ERROR", 5U) == 0) {
             printk("ERROR received from server: %s\r\n", transport_buffers.token);
         } else if (strcmp(transport_buffers.token, "SUP") == 0) {
-            printk("SUP received: settings packet reception started\r\n");
-            awaiting_settings_packet = true;
+            /* Backward-compatible diagnostic only.  Canonical Version 8 does
+             * not require SUP; a following AB... command-0x02 packet will be
+             * parsed normally by the next loop iteration. */
+            printk("Legacy SUP token received; canonical V8 expects binary command-0x02 directly\r\n");
         } else if (strcmp(transport_buffers.token, "FWUP") == 0) {
-            printk("FWUP received: firmware update handling is deferred and unsupported\r\n");
+            printk("FWUP received: firmware transfer handling is deferred and unsupported\r\n");
         } else if (strcmp(transport_buffers.token, "CONFIG_NONE") == 0) {
             printk("CONFIG_NONE received (legacy diagnostic response)\r\n");
         } else {
@@ -1422,8 +1422,13 @@ static void tcp_rx_thread(void *p1, void *p2, void *p3)
                                           sizeof(tcp_rx_chunk), 0);
             if (received == 0) {
                 printk("Server closed TCP socket\r\n");
-                if (awaiting_settings_packet) {
-                    printk("Connection closed before settings packet completed\r\n");
+                if (server_response_buffer_len > 0U) {
+                    if (transport_buffers.response[0] == 0xABU) {
+                        printk("Connection closed before binary server packet completed\r\n");
+                    } else {
+                        printk("Connection closed with an incomplete server response buffered\r\n");
+                    }
+                    server_response_buffer_len = 0U;
                 }
                 tcp_disconnect();
                 break;
