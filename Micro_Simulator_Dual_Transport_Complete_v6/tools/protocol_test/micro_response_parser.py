@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Incremental parser for server text tokens and SUP settings packets."""
+"""Incremental parser for server tokens and binary V8 configuration packets."""
 from __future__ import annotations
 from dataclasses import dataclass
 from micro_protocol import FIXED_PREFIX_BYTES, HEADER, PROPERTY
@@ -17,11 +17,16 @@ class ServerResponseParser:
         self.max_packet_bytes = max_packet_bytes
 
     def feed(self, data: bytes) -> list[ResponseEvent]:
+        if len(data) > self.max_packet_bytes - len(self.buffer):
+            raw = bytes(self.buffer) + data
+            self.buffer.clear()
+            self.awaiting_settings = False
+            return [ResponseEvent("RESPONSE_BUFFER_OVERFLOW", raw)]
         self.buffer.extend(data)
         events: list[ResponseEvent] = []
         while True:
-            if self.awaiting_settings:
-                event = self._extract_settings()
+            if self.awaiting_settings or self.buffer[:1] == bytes((HEADER,)):
+                event = self._extract_binary_settings(required_after_sup=self.awaiting_settings)
                 if event is None:
                     break
                 events.append(event)
@@ -67,19 +72,20 @@ class ServerResponseParser:
             return ResponseEvent("SETTINGS_TIMEOUT", raw)
         return ResponseEvent("RESPONSE_TIMEOUT", raw)
 
-    def _extract_settings(self) -> ResponseEvent | None:
+    def _extract_binary_settings(self, *, required_after_sup: bool) -> ResponseEvent | None:
         if not self.buffer:
             return None
         if self.buffer[0] != HEADER:
-            # Preserve enough context for diagnostics but avoid unbounded growth.
-            raw = bytes(self.buffer)
-            self.buffer.clear()
+            if not required_after_sup:
+                return None
+            raw = bytes(self.buffer[:1])
+            del self.buffer[:1]
             return ResponseEvent("INVALID_SETTINGS_PREFIX", raw)
         if len(self.buffer) < 4:
             return None
         if self.buffer[1] != PROPERTY:
-            raw = bytes(self.buffer[:2])
-            del self.buffer[:2]
+            raw = bytes(self.buffer[:1])
+            del self.buffer[:1]
             return ResponseEvent("INVALID_SETTINGS_PREFIX", raw)
         declared = int.from_bytes(self.buffer[2:4], "big")
         total = FIXED_PREFIX_BYTES + declared
@@ -91,4 +97,6 @@ class ServerResponseParser:
             return None
         packet = bytes(self.buffer[:total])
         del self.buffer[:total]
-        return ResponseEvent("SETTINGS_PACKET", packet, packet)
+        if packet[FIXED_PREFIX_BYTES] != 0x02:
+            return ResponseEvent("UNEXPECTED_BINARY_COMMAND", packet, packet)
+        return ResponseEvent("SETTINGS_PACKET" if required_after_sup else "DIRECT_SETTINGS_PACKET", packet, packet)

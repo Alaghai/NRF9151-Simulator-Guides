@@ -12,6 +12,16 @@ from micro_tcp_server import MicroStreamParser, decide_response
 IMEI = "861352064050787"
 OTHER_IMEI = "123456789012345"
 TS = 1784640600000
+V8_HEX_1 = (
+    "AB100058E62100010238363133353230363430353037383700010301B52666049E999A0096"
+    "01B33676049A8B1600C80190DA80045919AE03E802AABBCCDDEEFFFFEEDDCCBBAA03123456789012"
+    "987654321098DDEEFFAABBCC0050005A0226FF"
+)
+V8_HEX_2 = (
+    "AB1000520D6100010238363133353230363430353037383700010301B52666049E999A0096"
+    "01B33676049A8B1600C80190DA80045919AE03E80212345678901221098765432102FFDDBBEECCAA"
+    "AACCEEBBDDFF005F00DC0258FF"
+)
 
 
 def heartbeat(imei: str = IMEI, sequence: int = 1) -> bytes:
@@ -87,6 +97,48 @@ class ResponseParserTests(unittest.TestCase):
         self.assertEqual(parser.connection_closed().kind, "INCOMPLETE_SETTINGS")
         parser = ServerResponseParser(); parser.feed(b"SUP\n" + update()[:7])
         self.assertEqual(parser.timeout().kind, "SETTINGS_TIMEOUT")
+
+    def test_partner_v8_hex_1_canonical_and_direct_delivery_match(self) -> None:
+        packet = bytes.fromhex(V8_HEX_1)
+        decoded = decode_application_packet(packet, target_imei=IMEI)
+        self.assertTrue(decoded["valid"], decoded["errors"])
+        update = decoded["configuration_update"]
+        self.assertEqual((len(packet), packet[2:6], update["update_id"]), (96, bytes.fromhex("0058E621"), 1))
+        self.assertEqual((update["gps_safe_zone_count"], update["beacon_count"], update["trusted_device_count"]), (3, 2, 3))
+        self.assertEqual((update["heartbeat_interval_seconds"], update["lte_update_interval_seconds"], update["ble_check_interval_seconds"]), (80, 90, 550))
+
+        canonical = ServerResponseParser()
+        self.assertEqual(canonical.feed(b"SU"), [])
+        self.assertEqual([event.kind for event in canonical.feed(b"P\n" + packet[:17])], ["SUP"])
+        canonical_events = canonical.feed(packet[17:])
+        self.assertEqual([event.kind for event in canonical_events], ["SETTINGS_PACKET"])
+
+        direct = ServerResponseParser()
+        self.assertEqual(direct.feed(packet[:9]), [])
+        direct_events = direct.feed(packet[9:])
+        self.assertEqual([event.kind for event in direct_events], ["DIRECT_SETTINGS_PACKET"])
+        self.assertEqual(direct_events[0].packet, canonical_events[0].packet)
+
+    def test_partner_v8_hex_2_and_residual_token(self) -> None:
+        packet = bytes.fromhex(V8_HEX_2)
+        decoded = decode_application_packet(packet, target_imei=IMEI)
+        self.assertTrue(decoded["valid"], decoded["errors"])
+        update = decoded["configuration_update"]
+        self.assertEqual((len(packet), packet[2:6], update["update_id"]), (90, bytes.fromhex("00520D61"), 1))
+        self.assertEqual((update["gps_safe_zone_count"], update["beacon_count"], update["trusted_device_count"]), (3, 2, 2))
+        self.assertEqual((update["heartbeat_interval_seconds"], update["lte_update_interval_seconds"], update["ble_check_interval_seconds"]), (95, 220, 600))
+        parser = ServerResponseParser()
+        events = parser.feed(b"OK\n" + packet)
+        self.assertEqual([event.kind for event in events], ["OK", "DIRECT_SETTINGS_PACKET"])
+
+    def test_direct_invalid_crc_and_wrong_imei_remain_invalid(self) -> None:
+        packet = bytearray(bytes.fromhex(V8_HEX_1))
+        packet[-1] ^= 1
+        parser = ServerResponseParser()
+        event = parser.feed(bytes(packet))[0]
+        self.assertEqual(event.kind, "DIRECT_SETTINGS_PACKET")
+        self.assertFalse(decode_application_packet(event.packet, target_imei=IMEI)["valid"])
+        self.assertFalse(decode_application_packet(bytes.fromhex(V8_HEX_1), target_imei=OTHER_IMEI)["valid"])
 
 
 if __name__ == "__main__":

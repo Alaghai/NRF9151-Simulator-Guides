@@ -72,10 +72,10 @@ LOG_MODULE_REGISTER(micro_simulator, LOG_LEVEL_INF);
 #define SETTINGS_ERROR_TEXT_MAX 96
 
 #define TCP_RECV_POLL_MS 1000
-#define TCP_UPDATE_WAIT_MS 5000
 #define RELAY_PREFIX_MAX 64
 #define MICRO_HEARTBEAT_STACK_SIZE 4096
 #define MICRO_STATE_MACHINE_STACK_SIZE 3072
+#define MICRO_TCP_RX_STACK_SIZE 4096
 
 K_SEM_DEFINE(lte_connected, 0, 1);
 
@@ -224,14 +224,15 @@ static char last_config_source[16] = "none";
 static char last_config_error[SETTINGS_ERROR_TEXT_MAX];
 static uint32_t last_config_uptime_ms;
 static uint16_t next_update_id = 1U;
+static bool config_loaded_from_storage;
 
 static size_t server_response_buffer_len;
 static bool awaiting_settings_packet;
+static uint8_t tcp_rx_chunk[SERVER_RESPONSE_MAX];
 
-/* These buffers are shared by the serialized application paths below.  Keeping
- * them out of the system workqueue/main-thread frames is intentional: a
- * heartbeat may receive a response and parse settings before it returns.
- */
+/* These buffers are shared by serialized TX/CLI/parser work. Keeping them out
+ * of system-workqueue/main-thread frames avoids large stack use; TCP receive
+ * uses its own tcp_rx_chunk and is the sole socket-reader. */
 struct micro_transport_buffers {
     uint8_t packet[MAX_PACKET_BYTES];
     uint8_t payload[MAX_PACKET_BYTES];
@@ -258,6 +259,7 @@ K_MUTEX_DEFINE(micro_transport_mutex);
 K_SEM_DEFINE(micro_heartbeat_trigger, 0, 1);
 K_SEM_DEFINE(micro_state_reevaluation_trigger, 0, 1);
 K_SEM_DEFINE(micro_lte_location_trigger, 0, 1);
+K_SEM_DEFINE(micro_tcp_rx_start, 0, 1);
 
 static void heartbeat_timer_expiry(struct k_timer *timer);
 K_TIMER_DEFINE(micro_heartbeat_timer, heartbeat_timer_expiry, NULL);
@@ -278,6 +280,9 @@ K_THREAD_DEFINE(micro_state_machine, MICRO_STATE_MACHINE_STACK_SIZE, state_machi
                 NULL, NULL, NULL, 5, 0, 0);
 static void lte_location_thread(void *p1, void *p2, void *p3);
 K_THREAD_DEFINE(micro_lte_location, MICRO_STATE_MACHINE_STACK_SIZE, lte_location_thread,
+                NULL, NULL, NULL, 5, 0, 0);
+static void tcp_rx_thread(void *p1, void *p2, void *p3);
+K_THREAD_DEFINE(micro_tcp_rx, MICRO_TCP_RX_STACK_SIZE, tcp_rx_thread,
                 NULL, NULL, NULL, 5, 0, 0);
 
 static k_tid_t micro_main_thread;
@@ -731,7 +736,11 @@ static int persistent_settings_set(const char *name, size_t len,
     if (read_len != sizeof(active_config)) {
         return read_len < 0 ? (int)read_len : -EIO;
     }
-    return micro_settings_validate_config(&active_config);
+    int err = micro_settings_validate_config(&active_config);
+    if (err == 0) {
+        config_loaded_from_storage = true;
+    }
+    return err;
 }
 
 SETTINGS_STATIC_HANDLER_DEFINE(micro_config, "micro", NULL,
@@ -755,6 +764,7 @@ static int save_active_config(const struct micro_persistent_config *candidate)
 static int persistent_settings_init(void)
 {
     micro_settings_defaults(&active_config);
+    config_loaded_from_storage = false;
     int err = settings_subsys_init();
     if (err != 0 && err != -EALREADY) {
         LOG_ERR("settings subsystem init failed: %d", err);
@@ -769,6 +779,9 @@ static int persistent_settings_init(void)
             LOG_ERR("Could not store default simulator configuration: %d", err);
             return err;
         }
+    } else if (config_loaded_from_storage) {
+        LOG_INF("Simulator configuration loaded from persistent storage (update ID %u)",
+                active_config.last_update_id);
     }
     next_update_id = (uint16_t)(active_config.last_update_id + 1U);
     if (next_update_id == 0U) {
@@ -1169,6 +1182,9 @@ static int apply_settings_packet_bytes(const uint8_t *packet, size_t packet_len,
         return err;
     }
 
+    printk("Settings update %u validated from %s; persisting\r\n",
+           ctx->result.update_id, source);
+
     ctx->previous = active_config;
     err = save_active_config(&ctx->candidate);
     if (err != 0) {
@@ -1178,7 +1194,7 @@ static int apply_settings_packet_bytes(const uint8_t *packet, size_t packet_len,
     }
 
     record_config_result(0, source, &ctx->result, "");
-    printk("Settings update %u applied from %s (%u changed setting(s))\r\n",
+    printk("Settings update %u persisted and applied from %s (%u changed setting(s))\r\n",
            ctx->result.update_id, source, ctx->result.changed_count);
     print_settings_changes(&ctx->previous, &active_config, &ctx->result);
     if (ctx->previous.heartbeat_interval_seconds != active_config.heartbeat_interval_seconds) {
@@ -1250,6 +1266,10 @@ static int tcp_connect_to_server(const char *ip, uint16_t port)
     state.server_port = port;
 
     printk("TCP connected to %s:%u\r\n", state.server_ip, state.server_port);
+    server_response_buffer_len = 0U;
+    awaiting_settings_packet = false;
+    /* The RX worker is the sole zsock_recv() owner for this connection. */
+    k_sem_give(&micro_tcp_rx_start);
     schedule_next_heartbeat();
     return 0;
 }
@@ -1268,36 +1288,52 @@ static int process_server_response_bytes(const uint8_t *data, size_t len,
     int events = 0;
 
     while (server_response_buffer_len > 0U) {
-        if (awaiting_settings_packet) {
-            if (server_response_buffer_len < 4U) {
+        bool binary_prefix = transport_buffers.response[0] == 0xABU;
+        if (awaiting_settings_packet || binary_prefix) {
+            if (server_response_buffer_len < 2U) {
                 break;
             }
-            if (transport_buffers.response[0] != 0xABU ||
-                transport_buffers.response[1] != 0x10U) {
-                printk("Settings packet after SUP has invalid prefix\r\n");
-                server_response_buffer_len = 0U;
+            if (transport_buffers.response[1] != 0x10U) {
+                printk("%s binary packet has invalid property 0x%02X\r\n",
+                       awaiting_settings_packet ? "Settings packet after SUP" : "Direct server",
+                       transport_buffers.response[1]);
+                memmove(transport_buffers.response, &transport_buffers.response[1],
+                        server_response_buffer_len - 1U);
+                server_response_buffer_len--;
                 awaiting_settings_packet = false;
-                return -EBADMSG;
+                events++;
+                continue;
+            }
+            if (server_response_buffer_len < 4U) {
+                break;
             }
             uint16_t declared = read_u16_be(&transport_buffers.response[2]);
             size_t total = PACKET_COMMAND_OFFSET + declared;
             if (declared < 1U || total > MAX_PACKET_BYTES) {
-                printk("Settings packet after SUP has invalid length %u\r\n", declared);
-                server_response_buffer_len = 0U;
+                printk("Incoming binary packet has invalid length %u\r\n", declared);
+                memmove(transport_buffers.response, &transport_buffers.response[1],
+                        server_response_buffer_len - 1U);
+                server_response_buffer_len--;
                 awaiting_settings_packet = false;
-                return -EMSGSIZE;
+                events++;
+                continue;
             }
             if (server_response_buffer_len < total) {
                 break;
             }
-            printk("Complete settings packet received from %s (%u bytes)\r\n",
-                   source, (unsigned int)total);
-            int err = apply_settings_packet_bytes(transport_buffers.response, total, source);
-            if (err != 0) {
-                printk("Settings packet rejected: %d\r\n", err);
+
+            if (transport_buffers.response[PACKET_COMMAND_OFFSET] == MICRO_SETTINGS_COMMAND) {
+                printk("Complete %s configuration packet received from %s (%u bytes)\r\n",
+                       awaiting_settings_packet ? "SUP" : "direct", source, (unsigned int)total);
+                int err = apply_settings_packet_bytes(transport_buffers.response, total, source);
+                if (err != 0) {
+                    printk("Settings packet rejected: %d\r\n", err);
+                }
+            } else {
+                printk("Unexpected direct binary server command 0x%02X discarded\r\n",
+                       transport_buffers.response[PACKET_COMMAND_OFFSET]);
             }
-            memmove(transport_buffers.response,
-                    &transport_buffers.response[total],
+            memmove(transport_buffers.response, &transport_buffers.response[total],
                     server_response_buffer_len - total);
             server_response_buffer_len -= total;
             awaiting_settings_packet = false;
@@ -1351,66 +1387,65 @@ static int process_server_response_bytes(const uint8_t *data, size_t len,
 
 static int tcp_recv_response(void)
 {
-    if (!state.tcp_connected || state.tcp_fd < 0) {
-        printk("TCP not connected\r\n");
-        return -ENOTCONN;
-    }
-
-    int64_t deadline = k_uptime_get() + TCP_UPDATE_WAIT_MS;
-    int total_events = 0;
-    while (k_uptime_get() < deadline) {
-        struct zsock_pollfd pfd = {
-            .fd = state.tcp_fd,
-            .events = ZSOCK_POLLIN,
-            .revents = 0,
-        };
-        int remaining = (int)(deadline - k_uptime_get());
-        int poll_ms = MIN(TCP_RECV_POLL_MS, MAX(1, remaining));
-        int pr = zsock_poll(&pfd, 1, poll_ms);
-        if (pr == 0) {
-            if (total_events > 0 && !awaiting_settings_packet) {
-                return 0;
-            }
-            continue;
-        }
-        if (pr < 0) {
-            printk("poll failed: errno=%d\r\n", errno);
-            return -errno;
-        }
-        ssize_t n = zsock_recv(state.tcp_fd, transport_buffers.binary,
-                               sizeof(transport_buffers.binary), 0);
-        if (n == 0) {
-            printk("Server closed TCP socket\r\n");
-            if (awaiting_settings_packet) {
-                printk("Connection closed before settings packet completed\r\n");
-            }
-            tcp_disconnect();
-            return -ECONNRESET;
-        }
-        if (n < 0) {
-            printk("TCP recv failed: errno=%d\r\n", errno);
-            return -errno;
-        }
-        printk("Server response chunk (%d bytes)\r\n", (int)n);
-        int events = process_server_response_bytes(transport_buffers.binary,
-                                                   (size_t)n, "tcp");
-        if (events < 0) {
-            return events;
-        }
-        total_events += events;
-        if (total_events > 0 && !awaiting_settings_packet && server_response_buffer_len == 0U) {
-            return 0;
-        }
-    }
-
-    if (awaiting_settings_packet) {
-        printk("Timed out while waiting for complete settings packet\r\n");
-        awaiting_settings_packet = false;
-        server_response_buffer_len = 0U;
-        return -ETIMEDOUT;
-    }
-    printk("No complete server response within %d ms\r\n", TCP_UPDATE_WAIT_MS);
+    printk("TCP RX is handled continuously by the dedicated receiver\r\n");
     return 0;
+}
+
+static void tcp_rx_thread(void *p1, void *p2, void *p3)
+{
+    ARG_UNUSED(p1);
+    ARG_UNUSED(p2);
+    ARG_UNUSED(p3);
+    (void)k_thread_name_set(k_current_get(), "micro_tcp_rx");
+
+    while (true) {
+        (void)k_sem_take(&micro_tcp_rx_start, K_FOREVER);
+        while (state.tcp_connected && state.tcp_fd >= 0) {
+            struct zsock_pollfd pfd = {
+                .fd = state.tcp_fd,
+                .events = ZSOCK_POLLIN,
+                .revents = 0,
+            };
+            int poll_result = zsock_poll(&pfd, 1, TCP_RECV_POLL_MS);
+            if (poll_result == 0) {
+                continue;
+            }
+            if (poll_result < 0) {
+                printk("TCP RX poll failed: errno=%d\r\n", errno);
+                break;
+            }
+            if ((pfd.revents & ZSOCK_POLLIN) == 0) {
+                printk("TCP RX poll revents=0x%X\r\n", pfd.revents);
+                break;
+            }
+            ssize_t received = zsock_recv(state.tcp_fd, tcp_rx_chunk,
+                                          sizeof(tcp_rx_chunk), 0);
+            if (received == 0) {
+                printk("Server closed TCP socket\r\n");
+                if (awaiting_settings_packet) {
+                    printk("Connection closed before settings packet completed\r\n");
+                }
+                tcp_disconnect();
+                break;
+            }
+            if (received < 0) {
+                printk("TCP RX recv failed: errno=%d\r\n", errno);
+                break;
+            }
+
+            /* Receive never holds the transport mutex.  The short critical
+             * section below serializes parser state and atomic settings apply
+             * with CLI/TX work, without making zsock_recv() contend on it. */
+            (void)k_mutex_lock(&micro_transport_mutex, K_FOREVER);
+            printk("TCP RX chunk (%d bytes)\r\n", (int)received);
+            int processed = process_server_response_bytes(tcp_rx_chunk,
+                                                          (size_t)received, "tcp");
+            if (processed < 0) {
+                printk("TCP RX parser failed: %d\r\n", processed);
+            }
+            (void)k_mutex_unlock(&micro_transport_mutex);
+        }
+    }
 }
 
 static int tcp_send_hex_payload(const char *hex)
@@ -1458,7 +1493,6 @@ static int tcp_send_hex_payload(const char *hex)
         printk("Sent binary packet (%u bytes)\r\n", (unsigned int)bin_len);
     }
 
-    tcp_recv_response();
     return 0;
 }
 
@@ -1572,6 +1606,7 @@ static void log_relevant_stack_usage(const char *phase)
     log_thread_stack_usage(phase, micro_heartbeat);
     log_thread_stack_usage(phase, micro_state_machine);
     log_thread_stack_usage(phase, micro_lte_location);
+    log_thread_stack_usage(phase, micro_tcp_rx);
     log_thread_stack_usage(phase, k_work_queue_thread_get(&k_sys_work_q));
 
 }
@@ -1794,9 +1829,7 @@ static void heartbeat_thread(void *p1, void *p2, void *p3)
             printk("Automatic heartbeat failed: %d\r\n", err);
         }
 
-        /* The stack snapshot captures the deepest mark left by the completed
-         * send, including TCP receive and SUP/settings parsing when applicable.
-         */
+        /* TCP responses are received independently by micro_tcp_rx. */
         log_relevant_stack_usage("micro_heartbeat-after");
         schedule_next_heartbeat();
         (void)k_mutex_unlock(&micro_transport_mutex);
