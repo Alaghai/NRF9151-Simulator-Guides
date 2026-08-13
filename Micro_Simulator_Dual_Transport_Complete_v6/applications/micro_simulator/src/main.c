@@ -1366,7 +1366,7 @@ static int process_server_response_bytes(const uint8_t *data, size_t len,
         events++;
 
         if (strcmp(transport_buffers.token, "OK") == 0) {
-            printk("OK received: heartbeat accepted; no configuration update pending\r\n");
+            printk("OK received: packet accepted; no configuration update pending\r\n");
         } else if (strncmp(transport_buffers.token, "ERROR", 5U) == 0) {
             printk("ERROR received from server: %s\r\n", transport_buffers.token);
         } else if (strcmp(transport_buffers.token, "SUP") == 0) {
