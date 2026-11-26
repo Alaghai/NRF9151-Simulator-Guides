@@ -1,0 +1,26 @@
+[Unit]
+Description=Micro V8 TCP server
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+TimeoutStartSec=30s
+User=microtcp
+Group=microtcp
+WorkingDirectory=/opt/micro-tcp-server
+EnvironmentFile=/etc/micro-tcp-server.env
+ExecStart=/usr/bin/python3 -B -u /opt/micro-tcp-server/micro_tcp_server.py
+Restart=on-failure
+RestartSec=3
+UMask=0077
+StateDirectory=micro-tcp-server
+StateDirectoryMode=0700
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

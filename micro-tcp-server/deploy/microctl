@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Managed by create-password-operator.sh (Micro V8 TCP).
+set -euo pipefail
+
+if [[ $(id -un) != microtcp ]]; then
+    exec /usr/bin/sudo -n -u microtcp -- /usr/local/bin/microctl "$@"
+fi
+
+tool=/opt/micro-tcp-server/micro_update_tool.py
+database=/var/lib/micro-tcp-server/micro.sqlite3
+
+case ${1-} in
+    queue|queue-raw|generate|inspect|list|history|messages|devices|registry|cancel|remove|requeue)
+        exec /usr/bin/python3 -Es "$tool" --store "$database" "$@"
+        ;;
+    backup)
+        if (($# != 1)) || [[ -t 1 ]]; then
+            printf 'Use microctl backup with stdout redirected to a new private file.\n' >&2
+            exit 2
+        fi
+        umask 077
+        scratch=$(mktemp -d /tmp/microctl-backup.XXXXXXXXXX)
+        snapshot="$scratch/snapshot.sqlite3"
+        cleanup() {
+            rm -f -- "$snapshot" "$snapshot-journal" "$snapshot-wal" "$snapshot-shm"
+            rmdir -- "$scratch"
+        }
+        trap cleanup EXIT
+        trap 'exit 129' HUP
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        /usr/bin/python3 -Es "$tool" --store "$database" backup --out "$snapshot" >&2
+        cat -- "$snapshot"
+        ;;
+    ''|-h|--help)
+        printf '%s\n' 'Usage: microctl COMMAND [OPTIONS]' \
+            'Commands: queue, queue-raw, generate, inspect, list, history, messages, devices,' \
+            '          registry, cancel, remove, requeue, backup' \
+            'Use --help for options on individual queue and log commands.' \
+            'Redirect microctl backup to a new private file.'
+        ;;
+    *)
+        printf 'Unknown operator command. Run microctl --help.\n' >&2
+        exit 2
+        ;;
+esac
