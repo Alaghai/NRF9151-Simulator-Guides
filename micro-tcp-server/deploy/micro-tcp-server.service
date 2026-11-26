@@ -4,7 +4,9 @@ Wants=network-online.target
 After=network-online.target
 
 [Service]
-Type=exec
+Type=notify
+NotifyAccess=main
+TimeoutStartSec=30s
 User=microtcp
 Group=microtcp
 WorkingDirectory=/opt/micro-tcp-server

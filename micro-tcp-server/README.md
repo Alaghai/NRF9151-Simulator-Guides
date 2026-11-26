@@ -107,7 +107,7 @@ python3 micro_smoke_test.py --host 127.0.0.1 --port 5000 --imei 490154203237518
 sudo journalctl -u micro-tcp-server -n 50 --no-pager
 ```
 
-The installer enables and starts the service as `microtcp`. Application files go to `/opt/micro-tcp-server`, configuration to `/etc/micro-tcp-server.env`, and SQLite to `/var/lib/micro-tcp-server/micro.sqlite3`. Repeat the upload and install for updates. It preserves the service environment and database.
+The installer enables and starts the service as `microtcp`. It waits for the TCP listener and SQLite initialization before reporting the service active. Application files go to `/opt/micro-tcp-server`, configuration to `/etc/micro-tcp-server.env`, and SQLite to `/var/lib/micro-tcp-server/micro.sqlite3`. Repeat the upload and install for updates. It preserves the service environment and database.
 
 Deployment listens on `0.0.0.0:5000`. For tunnel-only use, edit `/etc/micro-tcp-server.env` with `sudoedit` and set `MICRO_SERVER_HOST=127.0.0.1`. You can also set `MICRO_ALLOWED_IMEIS=490154203237518` or use a comma-separated list. Restart with `sudo systemctl restart micro-tcp-server` and use a permitted IMEI in smoke checks. The service allows 32 simultaneous connections, uses TCP keepalive, and gives a partial frame 30 seconds to complete. The idle limit is 24 hours, which accommodates the maximum V8 interval of 65,535 seconds.
 

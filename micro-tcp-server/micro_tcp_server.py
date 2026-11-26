@@ -242,6 +242,16 @@ def handle_client(
                 LOG.exception("Could not record closure of connection %s", connection_id)
 
 
+def notify_systemd_ready() -> None:
+    address = os.environ.get("NOTIFY_SOCKET")
+    if not address:
+        return
+    if address.startswith("@"):
+        address = "\0" + address[1:]
+    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as notifier:
+        notifier.sendto(b"READY=1", address)
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     host = os.environ.get("MICRO_SERVER_HOST", "127.0.0.1")
@@ -268,6 +278,7 @@ def main() -> None:
         store = PendingUpdateStore(db_path)
         store.recover_interrupted_deliveries()
         LOG.info("Micro V8 TCP server listening on %s:%d with database %s", host, listener.getsockname()[1], db_path.resolve())
+        notify_systemd_ready()
         try:
             while True:
                 conn, addr = listener.accept()

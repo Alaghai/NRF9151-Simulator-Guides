@@ -1,5 +1,9 @@
 # Micro V8 server changes
 
+## Service startup
+
+- systemd waits for the TCP listener and SQLite initialization before returning from service startup. This lets the installer's immediate smoke test reach the listener reliably.
+
 ## DigitalOcean redeployment
 
 - The server delivers one raw binary V8 `0x02` response directly to a valid matching heartbeat. The previous listener sent `SUP\n` before the packet. V8 packet fields, byte order, length and CRC follow the supplied protocol documents.
