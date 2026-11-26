@@ -111,6 +111,25 @@ The installer enables and starts the service as `microtcp`. It waits for the TCP
 
 Deployment listens on `0.0.0.0:5000`. For tunnel-only use, edit `/etc/micro-tcp-server.env` with `sudoedit` and set `MICRO_SERVER_HOST=127.0.0.1`. You can also set `MICRO_ALLOWED_IMEIS=490154203237518` or use a comma-separated list. Restart with `sudo systemctl restart micro-tcp-server` and use a permitted IMEI in smoke checks. The service allows 32 simultaneous connections, uses TCP keepalive, and gives a partial frame 30 seconds to complete. The idle limit is 24 hours, which accommodates the maximum V8 interval of 65,535 seconds.
 
+### Set up the password operator login
+
+After installing the server, an administrator can create a `microoperator` login for operating the TCP service. From the project directory on Ubuntu, run:
+
+```bash
+sudo bash deploy/create-password-operator.sh
+```
+
+Enter and confirm the password at the Ubuntu prompt. From another computer, sign in with `ssh microoperator@DROPLET_IPV4` and enter that password. Share the SSH host, username, and verified host-key fingerprint. Pass the password through a private channel. Everyone using this login has the same operator permissions.
+
+The login can view the Micro journal, check or restart the TCP service, run an SSH tunnel to `127.0.0.1:5000`, inspect packets, manage settings, and save a SQLite snapshot. An administrator can run the setup command again to change the password. Root SSH authentication and the listener address stay as configured on the host.
+
+```bash
+microctl devices
+microctl messages --limit 20
+sudo systemctl status micro-tcp-server --no-pager
+sudo journalctl -u micro-tcp-server -f --no-pager
+```
+
 ## 4. Connect the simulator
 
 Run the server-side smoke check first. For a direct connection, from an approved Windows source, `Test-NetConnection -ComputerName $DropletIP -Port 5000` checks the network and `python micro_smoke_test.py --host $DropletIP --port 5000 --imei 490154203237518` checks the protocol. Use the IMEI configured for that lab check. A queued update for that IMEI will be consumed by the smoke heartbeat.
@@ -142,7 +161,7 @@ In the relay terminal, enter `transport relay`, `mode binary`, `set imei 4901542
 
 ## 5. Queue a settings update and verify it
 
-On Ubuntu, define this shortcut in the SSH shell for the commands below. For local Windows use `python micro_update_tool.py` or `py -3.12 micro_update_tool.py` in place of `microctl`. You can paste the single-line `queue` command into Anaconda Prompt, PowerShell, or Ubuntu after substituting the appropriate prefix.
+`microctl` is installed by the password operator setup. An Ubuntu administrator can also define the shortcut below to use the original administrative CLI. For local Windows use `python micro_update_tool.py` or `py -3.12 micro_update_tool.py` in place of `microctl`. You can paste the single-line `queue` command into Anaconda Prompt, PowerShell, or Ubuntu after substituting the appropriate prefix.
 
 ```bash
 microctl() {
@@ -174,13 +193,19 @@ To cancel a pending update, use `microctl cancel --imei 490154203237518`. To sen
 microctl devices
 microctl messages --imei 490154203237518 --kind packet --limit 20
 microctl messages --connection CONNECTION_ID --limit 100
-sudo journalctl -u micro-tcp-server -f
+sudo journalctl -u micro-tcp-server -f --no-pager
 df -h /var/lib/micro-tcp-server
 ```
 
 The CLI prints JSON. `packet` rows hold normalized application bytes and decoded fields. `raw_chunk` rows hold exact received bytes. `response_attempt` holds the intended reply bytes before the socket write. The paired `response_sent` or `response_failed` gives its observed result. The service journal reports lifecycle and operational errors. Keep an eye on the data volume because the message audit retains all rows and local backup copies also take disk space.
 
-To export a consistent live SQLite backup and download it, run the following in the Ubuntu shell. Store backup files on restricted storage with the same access controls as the live data.
+To export a consistent live SQLite backup as `microoperator`, run:
+
+```bash
+(umask 077; microctl backup > "$HOME/micro-$(date -u +%Y%m%dT%H%M%SZ).sqlite3")
+```
+
+To export with the original administrative CLI, use the administrator shortcut in step 5 and run the following in the Ubuntu shell. Store backup files on restricted storage with the same access controls as the live data.
 
 ```bash
 sudo install -d -m 0700 -o microtcp -g microtcp /var/lib/micro-tcp-server/backups

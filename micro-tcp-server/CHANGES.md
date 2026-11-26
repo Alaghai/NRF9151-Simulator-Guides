@@ -1,5 +1,9 @@
 # Micro V8 server changes
 
+## Operator login
+
+- The optional `microoperator` login uses its own SSH password and scoped service permissions. Its `microctl` command can read the audit, queue validated V8 settings packets, and export a SQLite snapshot.
+
 ## Service startup
 
 - systemd waits for the TCP listener and SQLite initialization before returning from service startup. This lets the installer's immediate smoke test reach the listener reliably.
